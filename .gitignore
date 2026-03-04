@@ -1,7 +1,19 @@
-# Environment variables (contains secrets)
-.env
+# ===========================================
+# Sensitive Data - MUST NOT BE COMMITTED
+# ===========================================
 
+# Environment variables (contains API keys)
+.env
+.env.local
+.env.*.local
+
+# Usage history (contains API key previews)
+usage_history.json
+
+# ===========================================
 # Python
+# ===========================================
+
 __pycache__/
 *.py[cod]
 *$py.class
@@ -22,27 +34,70 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
-# Virtual environments
+# ===========================================
+# Virtual Environments
+# ===========================================
+
 venv/
 ENV/
 env/
 .venv/
+.envs/
 
-# IDE
+# ===========================================
+# IDE & Editors
+# ===========================================
+
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
+*.sublime-workspace
+*.sublime-project
 
-# OS
+# ===========================================
+# OS Generated Files
+# ===========================================
+
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
 Thumbs.db
+ehthumbs.db
+Desktop.ini
 
+# ===========================================
 # Logs
+# ===========================================
+
 *.log
 logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Optional: uncomment to ignore usage history
-# usage_history.json
+# ===========================================
+# Other
+# ===========================================
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Test coverage
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
