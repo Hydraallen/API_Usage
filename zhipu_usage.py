@@ -20,17 +20,29 @@ from typing import Optional, Dict, Any, List
 from urllib.parse import quote
 from pathlib import Path
 
+# Detect environment (Docker vs local)
+IN_DOCKER = os.path.exists("/app/.dockerenv") or os.environ.get("DOCKER_ENV") == "true"
+DATA_DIR = Path("/app/data") if IN_DOCKER else Path(__file__).parent
+
 # Load environment variables from .env file
 def load_env():
     """Load environment variables from .env file"""
-    env_file = Path(__file__).parent / ".env"
-    if env_file.exists():
-        with open(env_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, value = line.split("=", 1)
-                    os.environ.setdefault(key.strip(), value.strip())
+    # Try Docker path first, then local
+    env_paths = [
+        DATA_DIR / ".env",
+        Path(__file__).parent / ".env",
+        Path("/app/.env")
+    ]
+    
+    for env_file in env_paths:
+        if env_file.exists():
+            with open(env_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, value = line.split("=", 1)
+                        os.environ.setdefault(key.strip(), value.strip())
+            return
 
 load_env()
 
@@ -346,11 +358,13 @@ def test_chat_completion(model: str = "glm-4-flash") -> Dict[str, Any]:
 
 def save_results(all_results: Dict[str, Any]) -> str:
     """Save results to a single JSON file with history"""
-    filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage_history.json")
+    # Ensure data directory exists
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    filepath = DATA_DIR / "usage_history.json"
     
     # Load existing history if file exists
     history = {"records": []}
-    if os.path.exists(filepath):
+    if filepath.exists():
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 history = json.load(f)

@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  zhipu-usage-monitor:
+    build: .
+    container_name: zhipu-usage-monitor
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - REFRESH_INTERVAL=15  # minutes
+    volumes:
+      # Mount .env file for API key
+      - ./.env:/app/data/.env:ro
+      # Persist usage history
+      - usage_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  usage_data:

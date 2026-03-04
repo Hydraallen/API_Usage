@@ -1,6 +1,6 @@
 # ZhipuAI Coding Plan 使用量查询工具
 
-查询智谱AI Coding Plan账户使用情况的脚本工具。
+查询智谱AI Coding Plan账户使用情况的脚本工具，支持本地运行和Docker部署。
 
 ## 🎉 重要发现
 
@@ -31,90 +31,146 @@ Authorization: Bearer your_api_key
 Authorization: your_api_key
 ```
 
-## 📈 查询结果示例
+---
 
-```
-📊 CODING PLAN 配额限制
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## 🚀 部署方式
 
-🏷️  账户等级: MAX
+### 方式一：Docker 部署（推荐）
 
-⏱️  5小时 Token 限额:
-   [###-------------------------------------] 9.0%
-   重置时间: 2026-03-04 18:06:32 (1小时 9分钟 后)
+适合部署到 NAS 服务器，支持自动刷新。
 
-📅 周度 Token 限额:
-   [####------------------------------------] 11.0%
-   重置时间: 2026-03-10 15:05:07 (5天 21小时 后)
+#### 1. 配置 API Key
 
-🔧 MCP 工具使用限额 (月度):
-   [####------------------------------------] 12.0%
-   已用: 4,000 / 4,000
-   剩余: 3,503
+```bash
+# 复制示例文件
+cp .env.sample .env
 
-🤖 模型使用统计 (24h)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📞 调用次数: 1,092
-🎫 Token 使用: 47,353,865
+# 编辑 .env 文件
+echo "ZHIPUAI_API_KEY=your_actual_api_key_here" > .env
 ```
 
-## 🚀 使用方法
+#### 2. 启动容器
 
-### 配置 API Key
+```bash
+# 构建并启动
+docker-compose up -d
 
-1. 复制示例文件：
+# 查看日志
+docker-compose logs -f
+
+# 停止
+docker-compose down
+```
+
+#### 3. 访问面板
+
+打开浏览器访问: `http://your-nas-ip:8080`
+
+#### 4. 自定义配置
+
+编辑 `docker-compose.yml` 修改端口或刷新间隔：
+
+```yaml
+environment:
+  - PORT=8080              # 服务端口
+  - REFRESH_INTERVAL=15    # 自动刷新间隔（分钟）
+```
+
+修改后重启：
+```bash
+docker-compose down && docker-compose up -d
+```
+
+---
+
+### 方式二：本地运行
+
+#### 1. 配置 API Key
+
 ```bash
 cp .env.sample .env
+# 编辑 .env 填入 API Key
 ```
 
-2. 编辑 `.env` 文件，填入你的 API Key：
-```
-ZHIPUAI_API_KEY=your_actual_api_key_here
-```
-
-### 运行脚本
+#### 2. 运行脚本
 
 ```bash
-# 运行查询脚本
+# 单次查询
 python3 zhipu_usage.py
 
-# 或者直接使用环境变量
+# 或使用环境变量
 export ZHIPUAI_API_KEY="your_api_key_here"
 python3 zhipu_usage.py
 ```
 
-### 查看可视化面板
+#### 3. 查看可视化面板
 
 ```bash
-# 方式1: 直接用浏览器打开
+# 方式1: 直接打开
 open dashboard.html
 
-# 方式2: 启动本地服务器（推荐，支持自动刷新）
-cd ~/.openclaw/workspace/API_Usage
+# 方式2: 本地服务器
 python3 -m http.server 8080
-# 然后访问 http://localhost:8080/dashboard.html
+# 访问 http://localhost:8080/dashboard.html
 ```
 
-**功能特性**:
-- 📊 实时显示配额限制（5小时/周度/月度）
-- 🤖 模型使用统计（24小时）
-- 🔧 MCP工具使用量
-- 📈 Token使用趋势图
-- 🔄 60秒自动刷新
+---
+
+## ✨ 功能特性
+
+| 功能 | 说明 |
+|------|------|
+| 📊 配额监控 | 5小时/周度/月度配额进度 |
+| 🤖 模型统计 | 24小时调用次数、Token使用量 |
+| 🔧 工具统计 | MCP工具使用量 |
+| 📈 趋势图 | Token使用历史趋势 |
+| 🔄 自动刷新 | Docker模式每15分钟自动更新 |
+| ⏰ 倒计时 | 显示下次更新时间 |
+| 🔄 强制更新 | 手动触发立即刷新 |
+
+---
 
 ## 📁 文件说明
 
 ```
 API_Usage/
-├── .gitignore          # Git忽略配置
-├── .env                # API密钥（不提交）
-├── .env.sample         # API密钥示例
-├── zhipu_usage.py      # 主查询脚本
-├── dashboard.html      # 可视化面板
-├── usage_history.json  # 历史记录（自动生成，最多保留100条）
-└── README.md           # 本文件
+├── Dockerfile           # Docker镜像配置
+├── docker-compose.yml   # Docker Compose配置
+├── server.py            # HTTP服务器（Docker用）
+├── zhipu_usage.py       # 主查询脚本
+├── dashboard.html       # 可视化面板
+├── .env                 # API密钥（不提交）
+├── .env.sample          # API密钥示例
+├── .gitignore           # Git忽略配置
+└── README.md            # 本文件
 ```
+
+---
+
+## 🐳 Docker 常用命令
+
+```bash
+# 构建镜像
+docker build -t zhipu-usage-monitor .
+
+# 手动运行
+docker run -d \
+  --name zhipu-usage-monitor \
+  -p 8080:8080 \
+  -v $(pwd)/.env:/app/data/.env:ro \
+  zhipu-usage-monitor
+
+# 查看日志
+docker logs -f zhipu-usage-monitor
+
+# 进入容器
+docker exec -it zhipu-usage-monitor /bin/bash
+
+# 重启容器
+docker restart zhipu-usage-monitor
+```
+
+---
 
 ## 📊 数据字段说明
 
@@ -148,47 +204,21 @@ API_Usage/
 | `totalZreadMcpCount` | ZRead调用次数 |
 | `toolDetails` | 工具详情列表 |
 
-## 🔧 集成建议
+---
 
-如果你想在自己的项目中使用这些API：
+## 🔧 API 接口（Docker模式）
 
-```python
-import requests
-from datetime import datetime, timedelta
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/` | GET | 重定向到 dashboard.html |
+| `/dashboard.html` | GET | 可视化面板 |
+| `/api/status` | GET | 获取服务状态 |
+| `/api/history` | GET | 获取历史数据 |
+| `/api/refresh` | GET/POST | 触发强制刷新 |
 
-def get_quota_limit(api_key: str) -> dict:
-    """获取配额限制"""
-    response = requests.get(
-        "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
-        headers={
-            "Authorization": api_key,  # 无Bearer前缀
-            "Accept-Language": "en-US,en"
-        }
-    )
-    return response.json()
-
-def get_model_usage(api_key: str) -> dict:
-    """获取24小时模型使用量"""
-    now = datetime.now()
-    start = now - timedelta(hours=24)
-    
-    response = requests.get(
-        "https://open.bigmodel.cn/api/monitor/usage/model-usage",
-        params={
-            "startTime": start.strftime("%Y-%m-%d %H:%M:%S"),
-            "endTime": now.strftime("%Y-%m-%d %H:%M:%S")
-        },
-        headers={
-            "Authorization": api_key,
-            "Accept-Language": "en-US,en"
-        }
-    )
-    return response.json()
-```
+---
 
 ## 🌐 Web 控制台
-
-如果需要更详细的信息，也可以访问：
 
 - 财务概览: https://bigmodel.cn/finance/overview
 - 用户权益: https://bigmodel.cn/usercenter/equity-mgmt/user-rights

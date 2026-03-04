@@ -45,7 +45,7 @@
         .status-bar {
             display: flex;
             justify-content: center;
-            gap: 20px;
+            gap: 15px;
             margin-bottom: 30px;
             flex-wrap: wrap;
         }
@@ -67,6 +67,55 @@
 
         .status-item .dot.online { background: #22c55e; }
         .status-item .dot.offline { background: #ef4444; }
+        .status-item .dot.refreshing { background: #f59e0b; animation: pulse 1s infinite; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .refresh-btn {
+            background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            transition: all 0.2s;
+        }
+
+        .refresh-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 4px 15px rgba(59, 130, 246, 0.4);
+        }
+
+        .refresh-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .refresh-btn .spinner {
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .countdown {
+            color: #f59e0b;
+            font-weight: 600;
+        }
 
         .cards-grid {
             display: grid;
@@ -373,10 +422,6 @@
             margin: 0 auto 20px;
         }
 
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
         footer {
             text-align: center;
             margin-top: 40px;
@@ -398,6 +443,15 @@
             .stats-grid {
                 grid-template-columns: 1fr;
             }
+
+            .status-bar {
+                gap: 10px;
+            }
+
+            .status-item {
+                padding: 8px 12px;
+                font-size: 0.85rem;
+            }
         }
     </style>
 </head>
@@ -415,12 +469,20 @@
             </div>
             <div class="status-item">
                 <span>📅</span>
-                <span id="last-update">--</span>
+                <span>上次更新: <strong id="last-update">--</strong></span>
+            </div>
+            <div class="status-item">
+                <span>⏰</span>
+                <span>下次更新: <strong class="countdown" id="countdown">--</strong></span>
             </div>
             <div class="status-item">
                 <span>🏷️</span>
                 <span>账户等级: <strong id="account-level">--</strong></span>
             </div>
+            <button class="refresh-btn" id="refresh-btn" onclick="forceRefresh()">
+                <span id="refresh-icon">🔄</span>
+                <span>强制更新</span>
+            </button>
         </div>
 
         <div id="content">
@@ -431,23 +493,51 @@
         </div>
 
         <footer>
-            <p>ZhipuAI Usage Monitor © 2026 | 数据来源: usage_history.json</p>
+            <p>ZhipuAI Usage Monitor © 2026 | 自动刷新间隔: <span id="refresh-interval">15</span> 分钟</p>
         </footer>
     </div>
 
     <script>
+        // Configuration
+        const API_BASE = '';  // Same origin
         const JSON_FILE = 'usage_history.json';
-        const REFRESH_INTERVAL = 60000; // 60秒自动刷新
+        const REFRESH_INTERVAL = 60000; // 60秒页面刷新
 
-        // 格式化数字
+        // State
+        let lastUpdateTime = null;
+        let nextUpdateTime = null;
+        let refreshIntervalMinutes = 15;
+        let isRefreshing = false;
+        let countdownTimer = null;
+
+        // Check if we're running with server API
+        const hasServerAPI = window.location.pathname !== '' || 
+                            window.location.protocol === 'http:' || 
+                            window.location.protocol === 'https:';
+
+        // Format number
         function formatNumber(num) {
             if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
             if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
             return num.toString();
         }
 
-        // 格式化时间
+        // Format time
         function formatTime(isoString) {
+            if (!isoString) return '--';
+            const date = new Date(isoString);
+            return date.toLocaleString('zh-CN', {
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        }
+
+        // Format short time
+        function formatShortTime(isoString) {
+            if (!isoString) return '--';
             const date = new Date(isoString);
             return date.toLocaleString('zh-CN', {
                 month: '2-digit',
@@ -457,7 +547,7 @@
             });
         }
 
-        // 格式化剩余时间
+        // Format remaining time
         function formatRemaining(timestamp) {
             const now = Date.now();
             const diff = timestamp - now;
@@ -473,14 +563,92 @@
             return `${hours}小时 ${minutes}分钟`;
         }
 
-        // 获取进度条颜色类
+        // Format countdown
+        function formatCountdown(seconds) {
+            if (seconds <= 0) return '即将更新';
+            const mins = Math.floor(seconds / 60);
+            const secs = seconds % 60;
+            return `${mins}分${secs}秒`;
+        }
+
+        // Get progress bar color class
         function getProgressClass(percentage) {
             if (percentage < 50) return 'low';
             if (percentage < 80) return 'medium';
             return 'high';
         }
 
-        // 渲染主内容
+        // Update countdown display
+        function updateCountdown() {
+            if (!nextUpdateTime) {
+                document.getElementById('countdown').textContent = '--';
+                return;
+            }
+
+            const now = Date.now();
+            const diff = Math.max(0, Math.floor((nextUpdateTime - now) / 1000));
+            document.getElementById('countdown').textContent = formatCountdown(diff);
+        }
+
+        // Update server status
+        async function updateServerStatus() {
+            if (!hasServerAPI) return;
+
+            try {
+                const response = await fetch(`${API_BASE}/api/status`);
+                if (response.ok) {
+                    const status = await response.json();
+                    lastUpdateTime = status.last_update ? new Date(status.last_update) : null;
+                    nextUpdateTime = status.next_update ? new Date(status.next_update) : null;
+                    refreshIntervalMinutes = status.refresh_interval_minutes || 15;
+                    document.getElementById('refresh-interval').textContent = refreshIntervalMinutes;
+                    document.getElementById('last-update').textContent = formatTime(status.last_update);
+                }
+            } catch (e) {
+                console.log('Server status not available');
+            }
+        }
+
+        // Force refresh
+        async function forceRefresh() {
+            if (isRefreshing) return;
+
+            isRefreshing = true;
+            const btn = document.getElementById('refresh-btn');
+            const icon = document.getElementById('refresh-icon');
+
+            btn.disabled = true;
+            icon.innerHTML = '<span class="spinner"></span>';
+            document.getElementById('status-dot').className = 'dot refreshing';
+            document.getElementById('status-text').textContent = '正在更新...';
+
+            try {
+                if (hasServerAPI) {
+                    // Trigger server refresh
+                    const response = await fetch(`${API_BASE}/api/refresh`, { method: 'POST' });
+                    if (response.ok) {
+                        const status = await response.json();
+                        lastUpdateTime = status.last_update ? new Date(status.last_update) : null;
+                        nextUpdateTime = status.next_update ? new Date(status.next_update) : null;
+                        document.getElementById('last-update').textContent = formatTime(status.last_update);
+                    }
+                }
+
+                // Wait a moment for data to be written
+                await new Promise(resolve => setTimeout(resolve, 2000));
+
+                // Reload data
+                await loadData();
+            } catch (e) {
+                console.error('Refresh failed:', e);
+            } finally {
+                isRefreshing = false;
+                btn.disabled = false;
+                icon.innerHTML = '🔄';
+            }
+        }
+
+        // Render main content
         function renderContent(data) {
             const latest = data.records[data.records.length - 1];
             const quotaLimits = latest.results.quota_limits;
@@ -488,37 +656,30 @@
             const toolUsage = latest.results.tool_usage;
             const apiTest = latest.results.api_test;
 
-            // 更新状态栏
+            // Update status bar
             const isSuccess = quotaLimits?.success || quotaLimits?.code === 200;
             document.getElementById('status-dot').className = 'dot ' + (isSuccess ? 'online' : 'offline');
             document.getElementById('status-text').textContent = isSuccess ? 'API 正常' : 'API 异常';
-            document.getElementById('last-update').textContent = formatTime(latest.query_time);
+            
+            if (!lastUpdateTime) {
+                document.getElementById('last-update').textContent = formatTime(latest.query_time);
+            }
+            
             document.getElementById('account-level').textContent = (quotaLimits?.data?.level || 'MAX').toUpperCase();
 
-            // 构建HTML
+            // Build HTML
             let html = '<div class="cards-grid">';
-
-            // 配额限制卡片
             html += renderQuotaCard(quotaLimits);
-
-            // 模型使用卡片
             html += renderModelCard(modelUsage);
-
-            // 工具使用卡片
             html += renderToolCard(toolUsage);
-
-            // API 状态卡片
             html += renderApiCard(apiTest);
-
             html += '</div>';
-
-            // 历史趋势图
             html += renderHistoryChart(data.records);
 
             document.getElementById('content').innerHTML = html;
         }
 
-        // 渲染配额卡片
+        // Render quota card
         function renderQuotaCard(quotaLimits) {
             const limits = quotaLimits?.data?.limits || quotaLimits?.limits || [];
             let html = `
@@ -571,7 +732,7 @@
             return html;
         }
 
-        // 渲染模型使用卡片
+        // Render model card
         function renderModelCard(modelUsage) {
             const data = modelUsage?.data || modelUsage;
             const total = data?.totalUsage || {};
@@ -609,7 +770,7 @@
             `;
         }
 
-        // 渲染工具使用卡片
+        // Render tool card
         function renderToolCard(toolUsage) {
             const data = toolUsage?.data || toolUsage;
             const total = data?.totalUsage || {};
@@ -658,7 +819,7 @@
             `;
         }
 
-        // 渲染API状态卡片
+        // Render API card
         function renderApiCard(apiTest) {
             const isSuccess = apiTest?.success;
             const usage = apiTest?.data?.usage || {};
@@ -697,19 +858,16 @@
             `;
         }
 
-        // 渲染历史趋势图
+        // Render history chart
         function renderHistoryChart(records) {
-            // 取最近20条记录
             const recent = records.slice(-20);
-
-            // 构建数据
             const labels = [];
             const values = [];
 
             for (const record of recent) {
                 const modelUsage = record.results.model_usage?.data || record.results.model_usage;
                 const total = modelUsage?.totalUsage?.totalTokensUsage || 0;
-                labels.push(formatTime(record.query_time));
+                labels.push(formatShortTime(record.query_time));
                 values.push(total);
             }
 
@@ -723,7 +881,7 @@
 
             let labelsHtml = '';
             for (let i = 0; i < labels.length; i++) {
-                labelsHtml += `<span>${labels[i].split(' ')[1]}</span>`;
+                labelsHtml += `<span>${labels[i].split(' ')[1] || labels[i]}</span>`;
             }
 
             return `
@@ -744,7 +902,7 @@
             `;
         }
 
-        // 渲染错误
+        // Render error
         function renderError(message) {
             document.getElementById('status-dot').className = 'dot offline';
             document.getElementById('status-text').textContent = '加载失败';
@@ -753,15 +911,19 @@
                 <div class="error-message">
                     <h2>❌ 加载失败</h2>
                     <p>${message}</p>
-                    <button class="btn" onclick="loadData()">重新加载</button>
+                    <button class="btn" onclick="forceRefresh()">重新加载</button>
                 </div>
             `;
         }
 
-        // 加载数据
+        // Load data
         async function loadData() {
             try {
-                const response = await fetch(JSON_FILE + '?t=' + Date.now());
+                const url = hasServerAPI 
+                    ? `${API_BASE}/api/history?t=${Date.now()}`
+                    : `${JSON_FILE}?t=${Date.now()}`;
+
+                const response = await fetch(url);
                 if (!response.ok) throw new Error('无法加载数据文件');
 
                 const data = await response.json();
@@ -775,11 +937,22 @@
             }
         }
 
-        // 初始化
-        loadData();
+        // Initialize
+        async function init() {
+            await updateServerStatus();
+            await loadData();
 
-        // 自动刷新
-        setInterval(loadData, REFRESH_INTERVAL);
+            // Start countdown timer
+            countdownTimer = setInterval(updateCountdown, 1000);
+
+            // Auto refresh page data
+            setInterval(async () => {
+                await updateServerStatus();
+                await loadData();
+            }, REFRESH_INTERVAL);
+        }
+
+        init();
     </script>
 </body>
 </html>
