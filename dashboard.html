@@ -511,9 +511,21 @@
         let countdownTimer = null;
 
         // Check if we're running with server API
-        const hasServerAPI = window.location.pathname !== '' || 
-                            window.location.protocol === 'http:' || 
-                            window.location.protocol === 'https:';
+        // Server API is only available when running server.py, not with simple http.server
+        let hasServerAPI = false;
+
+        // Detect server API availability
+        async function detectServerAPI() {
+            try {
+                const response = await fetch(`${API_BASE}/api/status`, { 
+                    method: 'GET',
+                    signal: AbortSignal.timeout(2000)
+                });
+                hasServerAPI = response.ok;
+            } catch (e) {
+                hasServerAPI = false;
+            }
+        }
 
         // Format number
         function formatNumber(num) {
@@ -939,6 +951,10 @@
 
         // Initialize
         async function init() {
+            // First detect if server API is available
+            await detectServerAPI();
+            console.log('Server API available:', hasServerAPI);
+            
             await updateServerStatus();
             await loadData();
 
