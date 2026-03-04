@@ -92,7 +92,7 @@ docker-compose down
 
 #### 4️⃣ 访问面板
 
-打开浏览器访问：**http://your-nas-ip:8080**
+打开浏览器访问：**http://your-nas-ip:23098**
 
 ---
 
@@ -157,7 +157,7 @@ API_Usage/
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `ZHIPUAI_API_KEY` | ✅ | - | 智谱AI API Key |
-| `PORT` | ❌ | 8080 | 服务端口（Docker用） |
+| `PORT` | ❌ | 23098 | 服务端口（Docker用） |
 | `REFRESH_INTERVAL` | ❌ | 15 | 自动刷新间隔（分钟） |
 
 ### 修改刷新间隔
@@ -166,7 +166,7 @@ API_Usage/
 
 ```yaml
 environment:
-  - PORT=8080
+  - PORT=23098
   - REFRESH_INTERVAL=30  # 改为30分钟
 ```
 
@@ -181,7 +181,7 @@ docker-compose down && docker-compose up -d
 
 ```yaml
 ports:
-  - "9000:8080"  # 改为9000端口
+  - "9000:23098"  # 改为9000端口
 ```
 
 ---
@@ -228,10 +228,10 @@ Docker 模式下提供以下 API：
 示例：
 ```bash
 # 获取状态
-curl http://localhost:8080/api/status
+curl http://localhost:23098/api/status
 
 # 触发刷新
-curl -X POST http://localhost:8080/api/refresh
+curl -X POST http://localhost:23098/api/refresh
 ```
 
 ---
@@ -279,7 +279,7 @@ curl -X POST http://localhost:8080/api/refresh
 **解决**：
 ```bash
 # 检查端口占用
-lsof -i :8080
+lsof -i :23098
 
 # 修改端口
 # 编辑 docker-compose.yml 中的 ports 配置

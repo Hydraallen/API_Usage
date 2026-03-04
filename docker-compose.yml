@@ -6,7 +6,7 @@ services:
     container_name: zhipu-usage-monitor
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "23098:8080"
     environment:
       - PORT=8080
       - REFRESH_INTERVAL=15  # minutes
