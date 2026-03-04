@@ -669,7 +669,6 @@
             const quotaLimits = latest.results.quota_limits;
             const modelUsage = latest.results.model_usage;
             const toolUsage = latest.results.tool_usage;
-            const apiTest = latest.results.api_test;
 
             // Update status bar
             const isSuccess = quotaLimits?.success || quotaLimits?.code === 200;
@@ -687,7 +686,6 @@
             html += renderQuotaCard(quotaLimits);
             html += renderModelCard(modelUsage);
             html += renderToolCard(toolUsage);
-            html += renderApiCard(apiTest);
             html += '</div>';
             html += renderHistoryChart(data.records);
 
@@ -829,44 +827,6 @@
                             <span class="tool-count">${formatNumber(total.totalSearchMcpCount || 0)}</span>
                         </div>
                         ${toolsHtml}
-                    </div>
-                </div>
-            `;
-        }
-
-        // Render API card
-        function renderApiCard(apiTest) {
-            const isSuccess = apiTest?.success;
-            const usage = apiTest?.data?.usage || {};
-
-            return `
-                <div class="card">
-                    <div class="card-header">
-                        <div class="card-icon api">🔌</div>
-                        <div class="card-title">
-                            <h2>API 状态</h2>
-                        </div>
-                    </div>
-                    <div class="api-status">
-                        <div class="api-test">
-                            <div class="label">
-                                <span>💬</span>
-                                <span>Chat Completion</span>
-                            </div>
-                            <span class="badge ${isSuccess ? 'success' : 'error'}">${isSuccess ? '✓ 正常' : '✗ 异常'}</span>
-                        </div>
-                        ${isSuccess ? `
-                        <div class="stats-grid">
-                            <div class="stat-item">
-                                <div class="stat-value blue">${usage.prompt_tokens || 0}</div>
-                                <div class="stat-label">输入 Tokens</div>
-                            </div>
-                            <div class="stat-item">
-                                <div class="stat-value green">${usage.completion_tokens || 0}</div>
-                                <div class="stat-label">输出 Tokens</div>
-                            </div>
-                        </div>
-                        ` : ''}
                     </div>
                 </div>
             `;
