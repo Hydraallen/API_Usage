@@ -10,7 +10,7 @@ import json
 import time
 import threading
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -43,7 +43,8 @@ def run_query():
     global last_update_time, next_update_time
     
     try:
-        print(f"[{datetime.now().isoformat()}] Running usage query...")
+        now = datetime.now(timezone.utc)
+        print(f"[{now.isoformat()}] Running usage query...")
         result = subprocess.run(
             ["python3", str(SCRIPT_PATH)],
             capture_output=True,
@@ -54,14 +55,14 @@ def run_query():
         
         if result.returncode == 0:
             with update_lock:
-                last_update_time = datetime.now()
-                next_update_time = last_update_time + timedelta(seconds=REFRESH_INTERVAL)
-            print(f"[{datetime.now().isoformat()}] Query completed successfully")
+                last_update_time = now
+                next_update_time = now + timedelta(seconds=REFRESH_INTERVAL)
+            print(f"[{datetime.now(timezone.utc).isoformat()}] Query completed successfully")
         else:
-            print(f"[{datetime.now().isoformat()}] Query failed: {result.stderr}")
+            print(f"[{datetime.now(timezone.utc).isoformat()}] Query failed: {result.stderr}")
             
     except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Query error: {e}")
+        print(f"[{datetime.now(timezone.utc).isoformat()}] Query error: {e}")
 
 def scheduler():
     """Background scheduler for auto-refresh"""
