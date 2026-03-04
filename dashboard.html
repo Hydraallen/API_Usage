@@ -534,10 +534,13 @@
             return num.toString();
         }
 
-        // Format time
+        // Format time - converts UTC to local timezone
         function formatTime(isoString) {
             if (!isoString) return '--';
-            const date = new Date(isoString);
+            // Treat as UTC if no timezone specified
+            const date = isoString.endsWith('Z') || isoString.includes('+') 
+                ? new Date(isoString) 
+                : new Date(isoString + 'Z');
             return date.toLocaleString('zh-CN', {
                 month: '2-digit',
                 day: '2-digit',
@@ -547,16 +550,16 @@
             });
         }
 
-        // Format short time
+        // Format short time (for chart labels) - converts UTC to local timezone
         function formatShortTime(isoString) {
             if (!isoString) return '--';
-            const date = new Date(isoString);
-            return date.toLocaleString('zh-CN', {
-                month: '2-digit',
-                day: '2-digit',
-                hour: '2-digit',
-                minute: '2-digit'
-            });
+            // Treat as UTC if no timezone specified
+            const date = isoString.endsWith('Z') || isoString.includes('+') 
+                ? new Date(isoString) 
+                : new Date(isoString + 'Z');
+            const hours = date.getHours().toString().padStart(2, '0');
+            const minutes = date.getMinutes().toString().padStart(2, '0');
+            return `${hours}:${minutes}`;
         }
 
         // Format remaining time
