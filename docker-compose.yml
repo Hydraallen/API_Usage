@@ -1,8 +1,9 @@
 services:
-  zhipu-usage-monitor:
+  api-usage-monitor:
     build: .
-    container_name: zhipu-usage-monitor
+    container_name: api_usage_monitor
     restart: unless-stopped
+    network_mode: bridge
     ports:
       - "23098:8080"
     environment:
