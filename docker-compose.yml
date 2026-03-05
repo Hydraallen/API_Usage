@@ -18,10 +18,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-    networks:
-      - bridge
-
-networks:
-  bridge:
-    external: true
-    name: bridge
