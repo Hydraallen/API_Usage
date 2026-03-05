@@ -11,6 +11,9 @@ WORKDIR /app
 # Install dependencies
 RUN pip install --no-cache-dir requests
 
+# Install curl for healthcheck
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+
 # Copy application files
 COPY zhipu_usage.py .
 COPY server.py .
