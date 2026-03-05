@@ -9,9 +9,8 @@ services:
       - PORT=8080
       - REFRESH_INTERVAL=15  # minutes
     volumes:
-      # Mount .env file for API key
-      - ./.env:/app/data/.env:ro
-      # Persist usage history (NAS path)
+      # Persist all data (NAS path: /volume6/docker/API_Usage)
+      # Contains: .env, usage_history.json
       - /volume6/docker/API_Usage:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/api/status"]
