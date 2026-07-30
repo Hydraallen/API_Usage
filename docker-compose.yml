@@ -14,7 +14,10 @@ services:
       # Contains: .env, usage_history.json
       - /volume6/docker/API_Usage:/app/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/status"]
+      # Must stay in sync with the HEALTHCHECK in Dockerfile: a healthcheck
+      # defined here overrides the image's own, and the image has no curl.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/api/status', timeout=5).status==200 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3

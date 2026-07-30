@@ -9,10 +9,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Install dependencies
-RUN pip install --no-cache-dir requests
-
-# Install curl for healthcheck
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir requests==2.34.2
 
 # Copy application files
 COPY zhipu_usage.py .
@@ -25,9 +22,9 @@ RUN mkdir -p /app/data
 # Expose port
 EXPOSE 8080
 
-# Health check
+# Health check (uses the image's built-in python3, so curl is not needed)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/api/status || exit 1
+    CMD python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/api/status', timeout=5).status == 200 else 1)" || exit 1
 
 # Run server
 CMD ["python3", "server.py"]
