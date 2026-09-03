@@ -7,6 +7,9 @@
 .env.local
 .env.*.local
 
+# Private deployment overrides (host paths, resource limits, secrets)
+docker-compose.override.yml
+
 # Usage history (contains API key previews)
 usage_history.json
 
@@ -30,6 +33,12 @@ lib64/
 parts/
 sdist/
 var/
+# NOTE: this `wheels/` rule comes from the generic Python section.
+# This project has ZERO third-party dependencies and does NOT vendor
+# any wheels — nothing is supposed to live in wheels/. The rule stays
+# only so stray build artifacts are ignored; if you ever DO add a
+# wheels/ directory on purpose, remember `git add` will silently skip
+# it until you remove this line.
 wheels/
 *.egg-info/
 .installed.cfg

@@ -302,6 +302,7 @@
         }
 
         .chart {
+            position: relative;
             height: 200px;
             display: flex;
             align-items: flex-end;
@@ -344,6 +345,107 @@
             text-align: center;
             font-size: 0.75rem;
             color: #666;
+        }
+
+        /* --- dual-axis trend chart --------------------------------------- */
+        .chart-wrap {
+            display: grid;
+            grid-template-columns: 60px 1fr 60px;
+            gap: 10px;
+        }
+
+        .chart-axis {
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding-top: 20px;
+            font-size: 0.7rem;
+            color: #777;
+        }
+
+        .chart-axis.right {
+            text-align: right;
+        }
+
+        .chart-axis .axis-title {
+            font-size: 0.65rem;
+            color: #999;
+            line-height: 1.3;
+        }
+
+        .chart-line-svg {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: 20px;
+            bottom: 0;
+            width: 100%;
+            height: calc(100% - 20px);
+            pointer-events: none;
+            overflow: visible;
+        }
+
+        .chart-bar.missing {
+            background: repeating-linear-gradient(45deg,
+                rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.10) 4px,
+                transparent 4px, transparent 8px);
+            min-height: 4px;
+        }
+
+        .chart-bar.missing::after {
+            content: '';
+        }
+
+        .chart-legend {
+            display: flex;
+            gap: 18px;
+            flex-wrap: wrap;
+            font-size: 0.75rem;
+            color: #888;
+            margin-top: 12px;
+        }
+
+        .chart-legend .swatch {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 3px;
+            margin-right: 6px;
+            vertical-align: -1px;
+        }
+
+        .chart-legend .swatch.bar { background: linear-gradient(180deg, #3b82f6, #1d4ed8); }
+        .chart-legend .swatch.line { background: #f59e0b; }
+        .chart-legend .swatch.missing {
+            background: repeating-linear-gradient(45deg,
+                rgba(255, 255, 255, 0.25), rgba(255, 255, 255, 0.25) 3px,
+                transparent 3px, transparent 6px);
+        }
+
+        /* --- live balance freshness badge --------------------------------- */
+        .freshness {
+            margin-left: auto;
+            font-size: 0.75rem;
+            padding: 4px 10px;
+            border-radius: 999px;
+            white-space: nowrap;
+            border: 1px solid transparent;
+        }
+
+        .freshness.loading { background: rgba(148, 163, 184, 0.15); color: #94a3b8; border-color: rgba(148, 163, 184, 0.3); }
+        .freshness.fresh   { background: rgba(34, 197, 94, 0.15);  color: #4ade80; border-color: rgba(34, 197, 94, 0.35); }
+        .freshness.stale   { background: rgba(234, 179, 8, 0.15);  color: #facc15; border-color: rgba(234, 179, 8, 0.35); }
+        .freshness.error   { background: rgba(239, 68, 68, 0.18);  color: #f87171; border-color: rgba(239, 68, 68, 0.45); }
+
+        .quota-error {
+            background: rgba(239, 68, 68, 0.12);
+            border: 1px solid rgba(239, 68, 68, 0.4);
+            color: #fca5a5;
+            border-radius: 10px;
+            padding: 10px 14px;
+            font-size: 0.85rem;
+            margin-bottom: 16px;
+            word-break: break-all;
         }
 
         .api-status {
@@ -514,6 +616,17 @@
         // Server API is only available when running server.py, not with simple http.server
         let hasServerAPI = false;
 
+        // Live quota state (the /api/quota/live path — this is what makes the
+        // page fresh; the 15-minute scheduler only feeds the trend chart).
+        // liveQuota shape mirrors the server contract:
+        //   { ok, cached, age_seconds, ttl_seconds, fetched_at, data, error }
+        let liveQuota = null;          // last successful live payload
+        let liveQuotaError = null;     // last error string
+        let liveQuotaFetchedAt = null; // client-side Date of that fetch
+        let liveQuotaLoading = true;
+        let contentRendered = false;
+        let freshnessTimer = null;
+
         // Detect server API availability
         async function detectServerAPI() {
             try {
@@ -527,11 +640,28 @@
             }
         }
 
-        // Format number
+        // Format number — must never throw on undefined/null/NaN, otherwise a
+        // single missing field takes the whole page down.
         function formatNumber(num) {
-            if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
-            if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
-            return num.toString();
+            if (num === null || num === undefined) return '--';
+            const n = typeof num === 'number' ? num : Number(num);
+            if (!isFinite(n)) return '--';
+            const sign = n < 0 ? '-' : '';
+            const a = Math.abs(n);
+            if (a >= 1000000) return sign + (a / 1000000).toFixed(1) + 'M';
+            if (a >= 1000) return sign + (a / 1000).toFixed(1) + 'K';
+            return sign + String(a);
+        }
+
+        // Human readable age for the live-balance badge
+        function formatAge(seconds) {
+            if (seconds === null || seconds === undefined || !isFinite(seconds)) return '--';
+            const s = Math.max(0, Math.round(seconds));
+            if (s < 5) return '刚刚更新';
+            if (s < 60) return `${s} 秒前`;
+            const m = Math.floor(s / 60);
+            if (m < 60) return `${m} 分钟前`;
+            return `${Math.floor(m / 60)} 小时前`;
         }
 
         // Format time - converts UTC to local timezone
@@ -618,10 +748,94 @@
                     refreshIntervalMinutes = status.refresh_interval_minutes || 15;
                     document.getElementById('refresh-interval').textContent = refreshIntervalMinutes;
                     document.getElementById('last-update').textContent = formatTime(status.last_update);
+                    if (status.last_error) {
+                        const dot = document.getElementById('status-dot');
+                        const text = document.getElementById('status-text');
+                        if (dot) dot.className = 'dot offline';
+                        if (text) text.textContent = '采集异常 (' + (status.consecutive_failures || 0) + ' 次连续失败)';
+                        console.warn('Collector error:', status.last_error);
+                    }
                 }
             } catch (e) {
                 console.log('Server status not available');
             }
+        }
+
+        // ------------------------------------------------------------------
+        // Live balance: one read-only upstream call behind a 60s server cache.
+        // Contract with server.py GET /api/quota/live:
+        //   200 { ok:true,  cached, age_seconds, ttl_seconds, fetched_at,
+        //         data:{ level, limits:[...] }, error:null }
+        //   502 { ok:false, cached, age_seconds, ttl_seconds, fetched_at,
+        //         data:null, error:"..." }
+        // ------------------------------------------------------------------
+        async function refreshLiveQuota() {
+            liveQuotaLoading = true;
+            renderFreshness();
+            try {
+                const response = await fetch(`${API_BASE}/api/quota/live?t=${Date.now()}`);
+                const payload = await response.json();
+                if (payload && payload.ok && payload.data) {
+                    liveQuota = payload;
+                    liveQuotaError = null;
+                    liveQuotaFetchedAt = Date.now() - (payload.age_seconds || 0) * 1000;
+                } else {
+                    liveQuotaError = (payload && payload.error) || `HTTP ${response.status}`;
+                }
+            } catch (e) {
+                liveQuotaError = e.message || String(e);
+            } finally {
+                liveQuotaLoading = false;
+                applyLiveQuota();
+            }
+        }
+
+        // Swap the balance numbers in place once the live payload lands.
+        // On failure we show an explicit error badge — we never fall back to 0
+        // or blank, which would silently look like "you used nothing".
+        function applyLiveQuota() {
+            if (!contentRendered) return;
+            const body = document.getElementById('quota-card-body');
+            if (body && liveQuota && liveQuota.data) {
+                body.innerHTML = renderQuotaLimits(liveQuota.data.limits || []);
+            }
+            const levelEl = document.getElementById('account-level');
+            if (levelEl && liveQuota && liveQuota.data && liveQuota.data.level) {
+                levelEl.textContent = String(liveQuota.data.level).toUpperCase();
+            }
+            const errEl = document.getElementById('quota-error');
+            if (errEl) {
+                if (liveQuotaError) {
+                    errEl.style.display = 'block';
+                    errEl.textContent = `⚠️ 实时余额获取失败（下方为最近一次采集的历史值）：${liveQuotaError}`;
+                } else {
+                    errEl.style.display = 'none';
+                }
+            }
+            renderFreshness();
+        }
+
+        function renderFreshness() {
+            const el = document.getElementById('quota-freshness');
+            if (!el) return;
+            if (liveQuotaError) {
+                el.className = 'freshness error';
+                el.textContent = '⚠️ 实时余额获取失败';
+                return;
+            }
+            if (liveQuotaLoading && !liveQuota) {
+                el.className = 'freshness loading';
+                el.textContent = '⏳ 正在获取实时余额…';
+                return;
+            }
+            if (!liveQuota || !liveQuotaFetchedAt) {
+                el.className = 'freshness stale';
+                el.textContent = '历史快照';
+                return;
+            }
+            const ageSec = (Date.now() - liveQuotaFetchedAt) / 1000;
+            el.className = 'freshness ' + (ageSec < 90 ? 'fresh' : 'stale');
+            el.textContent = '🟢 ' + formatAge(ageSec);
         }
 
         // Force refresh
@@ -652,8 +866,8 @@
                 // Wait a moment for data to be written
                 await new Promise(resolve => setTimeout(resolve, 2000));
 
-                // Reload data
-                await loadData();
+                // Reload data + live balance
+                await Promise.all([loadData(), refreshLiveQuota()]);
             } catch (e) {
                 console.error('Refresh failed:', e);
             } finally {
@@ -670,8 +884,10 @@
             const modelUsage = latest.results.model_usage;
             const toolUsage = latest.results.tool_usage;
 
-            // Update status bar
-            const isSuccess = quotaLimits?.success || quotaLimits?.code === 200;
+            // Update status bar.
+            // `ok` is the new per-query flag; `success`/`code` are the legacy
+            // envelope fields still present in the 100 pre-existing records.
+            const isSuccess = quotaLimits?.ok ?? (quotaLimits?.success || quotaLimits?.code === 200);
             document.getElementById('status-dot').className = 'dot ' + (isSuccess ? 'online' : 'offline');
             document.getElementById('status-text').textContent = isSuccess ? 'API 正常' : 'API 异常';
             
@@ -690,12 +906,19 @@
             html += renderHistoryChart(data.records);
 
             document.getElementById('content').innerHTML = html;
+            contentRendered = true;
+
+            // If the live payload already arrived while history was rendering,
+            // overwrite the historical numbers right away.
+            applyLiveQuota();
         }
 
-        // Render quota card
+        // Render quota card.
+        // Body is rendered from the newest HISTORY record so the page paints
+        // with zero latency; applyLiveQuota() then swaps in the live numbers.
         function renderQuotaCard(quotaLimits) {
             const limits = quotaLimits?.data?.limits || quotaLimits?.limits || [];
-            let html = `
+            return `
                 <div class="card">
                     <div class="card-header">
                         <div class="card-icon quota">📊</div>
@@ -703,15 +926,23 @@
                             <h2>配额限制</h2>
                             <span>Quota Limits</span>
                         </div>
+                        <span class="freshness loading" id="quota-freshness">⏳ 正在获取实时余额…</span>
                     </div>
+                    <div class="quota-error" id="quota-error" style="display:none"></div>
+                    <div id="quota-card-body">${renderQuotaLimits(limits)}</div>
+                </div>
             `;
+        }
 
+        // Render just the limit rows (shared by history render and live swap)
+        function renderQuotaLimits(limits) {
+            let html = '';
             const typeNames = {
                 'TOKENS_LIMIT': '🎫 Token 限额',
                 'TIME_LIMIT': '🔧 MCP 工具限额'
             };
 
-            for (const limit of limits) {
+            for (const limit of (limits || [])) {
                 const type = limit.type;
                 const unit = limit.unit;
                 const number = limit.number;
@@ -741,7 +972,9 @@
                 `;
             }
 
-            html += '</div>';
+            if (!html) {
+                html = '<div class="quota-meta"><span>暂无配额数据</span></div>';
+            }
             return html;
         }
 
@@ -832,30 +1065,92 @@
             `;
         }
 
-        // Render history chart
+        // Pull the 24h rolling cumulative token total out of one record.
+        // Returns null when that record has no usable model-usage data, so the
+        // chart can skip it instead of pretending it was 0.
+        function recordCumulative(record) {
+            const mu = record?.results?.model_usage;
+            if (!mu) return null;
+            // New records carry ok:false on failure; legacy ones have no flag.
+            if (mu.ok === false) return null;
+            const data = mu.data || mu;
+            const total = data?.totalUsage?.totalTokensUsage;
+            if (typeof total !== 'number' || !isFinite(total)) return null;
+            return total;
+        }
+
+        // Render history chart — DUAL AXIS.
+        //
+        // The upstream figure is a 24h ROLLING total, so plotting it directly as
+        // bars drew a flat line. Now:
+        //   bars  (left axis)  = delta between two consecutive records, i.e. the
+        //                        real consumption inside one 15-minute interval
+        //   line  (right axis) = the original cumulative 24h total
+        // A missing previous value, a skipped/failed record, or a negative delta
+        // (the rolling window slid old traffic out) is drawn as a hatched
+        // "no data" bar — never as a 0 bar and never as a negative bar.
         function renderHistoryChart(records) {
             const recent = records.slice(-20);
-            const labels = [];
-            const values = [];
 
-            for (const record of recent) {
-                const modelUsage = record.results.model_usage?.data || record.results.model_usage;
-                const total = modelUsage?.totalUsage?.totalTokensUsage || 0;
-                labels.push(formatShortTime(record.query_time));
-                values.push(total);
+            const points = recent.map(r => ({
+                label: formatShortTime(r.query_time),
+                cumulative: recordCumulative(r),
+                partial: r?.partial === true
+            }));
+
+            // Delta needs the record right before the window too, when available
+            const priorIndex = records.length - recent.length - 1;
+            let prevCumulative = priorIndex >= 0 ? recordCumulative(records[priorIndex]) : null;
+
+            for (const p of points) {
+                if (p.cumulative === null || prevCumulative === null) {
+                    p.delta = null;              // no baseline -> skip, not 0
+                } else {
+                    const d = p.cumulative - prevCumulative;
+                    p.delta = d < 0 ? null : d;  // window slid out -> treat as missing
+                }
+                if (p.cumulative !== null) prevCumulative = p.cumulative;
             }
 
-            const maxVal = Math.max(...values, 1);
+            const deltas = points.map(p => p.delta).filter(v => v !== null);
+            const cums = points.map(p => p.cumulative).filter(v => v !== null);
+            const maxDelta = deltas.length ? Math.max(...deltas, 1) : 1;
+            const maxCum = cums.length ? Math.max(...cums, 1) : 1;
 
             let barsHtml = '';
-            for (let i = 0; i < values.length; i++) {
-                const height = (values[i] / maxVal) * 100;
-                barsHtml += `<div class="chart-bar" style="height: ${height}%" data-value="${formatNumber(values[i])}"></div>`;
+            for (const p of points) {
+                if (p.delta === null) {
+                    barsHtml += `<div class="chart-bar missing" title="${p.label} 无增量数据"></div>`;
+                } else {
+                    const height = Math.max(2, (p.delta / maxDelta) * 100);
+                    barsHtml += `<div class="chart-bar" style="height: ${height}%" data-value="${formatNumber(p.delta)}"></div>`;
+                }
             }
 
+            // Cumulative polyline on the secondary axis (percent viewBox so it
+            // stretches with the container; no chart library needed).
+            const n = points.length;
+            const segs = [];
+            let current = [];
+            for (let i = 0; i < n; i++) {
+                const c = points[i].cumulative;
+                if (c === null) {
+                    if (current.length > 1) segs.push(current);
+                    current = [];
+                    continue;
+                }
+                const x = n === 1 ? 50 : (i / (n - 1)) * 100;
+                const y = 100 - (c / maxCum) * 100;
+                current.push(`${x.toFixed(2)},${y.toFixed(2)}`);
+            }
+            if (current.length > 1) segs.push(current);
+            const lineHtml = segs
+                .map(seg => `<polyline points="${seg.join(' ')}" fill="none" stroke="#f59e0b" stroke-width="1.5" vector-effect="non-scaling-stroke" />`)
+                .join('');
+
             let labelsHtml = '';
-            for (let i = 0; i < labels.length; i++) {
-                labelsHtml += `<span>${labels[i].split(' ')[1] || labels[i]}</span>`;
+            for (const p of points) {
+                labelsHtml += `<span>${p.label.split(' ')[1] || p.label}</span>`;
             }
 
             return `
@@ -865,11 +1160,29 @@
                         <span style="color: #888">最近 ${records.length} 次查询</span>
                     </div>
                     <div class="chart-container">
-                        <div class="chart">
-                            ${barsHtml}
+                        <div class="chart-wrap">
+                            <div class="chart-axis left">
+                                <span class="axis-title">增量<br>${formatNumber(maxDelta)}</span>
+                                <span>0</span>
+                            </div>
+                            <div>
+                                <div class="chart">
+                                    ${barsHtml}
+                                    <svg class="chart-line-svg" viewBox="0 0 100 100" preserveAspectRatio="none">${lineHtml}</svg>
+                                </div>
+                                <div class="chart-labels">
+                                    ${labelsHtml}
+                                </div>
+                            </div>
+                            <div class="chart-axis right">
+                                <span class="axis-title">累计24h<br>${formatNumber(maxCum)}</span>
+                                <span>0</span>
+                            </div>
                         </div>
-                        <div class="chart-labels">
-                            ${labelsHtml}
+                        <div class="chart-legend">
+                            <span><i class="swatch bar"></i>柱状：区间增量（左轴）</span>
+                            <span><i class="swatch line"></i>折线：24h 累计总量（右轴）</span>
+                            <span><i class="swatch missing"></i>斜纹：该区间无有效增量</span>
                         </div>
                     </div>
                 </div>
@@ -890,15 +1203,22 @@
             `;
         }
 
-        // Load data
+        // Load data. Tries the server API first and falls back to the static
+        // JSON file, so it no longer has to wait for detectServerAPI().
         async function loadData() {
             try {
-                const url = hasServerAPI 
-                    ? `${API_BASE}/api/history?t=${Date.now()}`
-                    : `${JSON_FILE}?t=${Date.now()}`;
-
-                const response = await fetch(url);
-                if (!response.ok) throw new Error('无法加载数据文件');
+                let response = await fetch(`${API_BASE}/api/history?t=${Date.now()}`).catch(() => null);
+                if (!response || !response.ok) {
+                    let detail = '';
+                    if (response) {
+                        try {
+                            const body = await response.clone().json();
+                            if (body && body.error) detail = `：${body.error}`;
+                        } catch (e) { /* not JSON */ }
+                    }
+                    response = await fetch(`${JSON_FILE}?t=${Date.now()}`).catch(() => null);
+                    if (!response || !response.ok) throw new Error('无法加载数据文件' + detail);
+                }
 
                 const data = await response.json();
                 if (!data.records || data.records.length === 0) {
@@ -911,19 +1231,30 @@
             }
         }
 
-        // Initialize
+        // Initialize.
+        // History paints the page immediately (0 latency) while the live
+        // balance request runs concurrently and replaces the numbers on arrival.
         async function init() {
-            // First detect if server API is available
-            await detectServerAPI();
-            console.log('Server API available:', hasServerAPI);
-            
-            await updateServerStatus();
-            await loadData();
+            const historyPromise = loadData();
+            const livePromise = refreshLiveQuota();
+
+            detectServerAPI().then(() => {
+                console.log('Server API available:', hasServerAPI);
+                return updateServerStatus();
+            });
+
+            await Promise.allSettled([historyPromise, livePromise]);
 
             // Start countdown timer
             countdownTimer = setInterval(updateCountdown, 1000);
 
-            // Auto refresh page data
+            // Keep the freshness badge honest between live refreshes
+            freshnessTimer = setInterval(renderFreshness, 1000);
+
+            // Live balance stays fresh on its own cadence (server caches 60s)
+            setInterval(refreshLiveQuota, 60000);
+
+            // Auto refresh history / trend data
             setInterval(async () => {
                 await updateServerStatus();
                 await loadData();
