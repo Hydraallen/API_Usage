@@ -344,11 +344,27 @@ curl -X POST http://localhost:8080/api/refresh
 ## 🔒 安全说明
 
 - `.env` 文件包含敏感信息，**已自动忽略**提交到Git
-- `usage_history.json` 只写脱敏预览（前 6 位 + 后 4 位），且**已自动忽略**提交到Git
+- `usage_history.json` **不再写入任何与 Key 相关的字段**（`api_key_preview` 已彻底移除），且**已自动忽略**提交到Git
 - `docker-compose.override.yml`（私有路径 / 密钥）**已自动忽略**提交到Git
 - 请勿在公开场合分享你的 API Key
 - 服务只服务白名单静态文件，源码不可通过 HTTP 下载
 - 接口不再下发 `Access-Control-Allow-Origin: *`，仅同源可读
+- 启动横幅只打印「已配置 / 未配置」与 Key 长度，**不输出 Key 的任何字符片段**
+- `/api/status` 的 `last_error` 在下发前会做一次兜底脱敏，把 Key 原文替换为 `[REDACTED]`
+
+### 关于公网暴露
+
+**本项目的所有 HTTP 端点（页面与 `/api/*`）都是按「可公开访问」设计的**：
+
+- 响应体里不含任何凭证、凭证片段、内网地址或宿主机路径
+- `POST /api/refresh` 自带节流：默认 60 秒最多触发一次，超出返回 `429`
+  （带 `Retry-After`），与「正在跑」的 `409` 语义区分；节流窗口可用
+  `REFRESH_MIN_INTERVAL` 环境变量调整
+- 静态文件走白名单，`/server.py` 之类一律 404
+
+因此本项目**自身不内置任何认证机制**。如果你希望限制访问（例如只允许内网、
+或加一层口令），请在反向代理层自行处理（Caddy `basic_auth`、Nginx
+`auth_basic`、IP 白名单等）——应用层不会替你做这件事。
 
 ---
 
@@ -415,6 +431,16 @@ docker compose restart
 ---
 
 ## 📝 更新日志
+
+### v1.3.0 (2026-09-03)
+
+- 🔐 **彻底移除 `api_key_preview`**：`api_key_preview()` 函数删除，落盘记录里
+  不再有这个键，启动横幅改为只打印「已配置 / 未配置 + 长度」。
+  历史文件与 `/api/history` 现在完全不含 Key 的任何字符
+- 🚦 `POST /api/refresh` 新增节流：默认 60 秒一次，超出返回 `429` +
+  `Retry-After`，前端收到 429/409 给出友好提示而不是报错
+- 🛡️ `/api/status` 的 `last_error` 增加兜底脱敏（`_redact()`）
+- 📖 README 新增「关于公网暴露」一节，明确端点可公开、认证由反代负责
 
 ### v1.2.0 (2026-09-03)
 

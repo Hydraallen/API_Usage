@@ -31,6 +31,13 @@ HISTORY_FILE = DATA_DIR / "usage_history.json"
 
 # Live quota cache TTL (seconds)
 LIVE_QUOTA_TTL = int(os.environ.get("LIVE_QUOTA_TTL", 60))
+
+# Minimum spacing between two manual POST /api/refresh triggers (seconds).
+# /api/refresh is public and unauthenticated by design, so it needs a throttle
+# of its own: without one anybody could drive the upstream query loop as fast
+# as they can issue requests. This is distinct from the 409 concurrency guard —
+# 429 means "too soon", 409 means "one is running right now".
+REFRESH_MIN_INTERVAL = int(os.environ.get("REFRESH_MIN_INTERVAL", 60))
 QUOTA_ENDPOINT = "/api/monitor/usage/quota/limit"
 
 # Only these paths may be served from disk. Everything else 404s.
@@ -52,6 +59,8 @@ last_error = None
 consecutive_failures = 0
 query_in_progress = False
 update_lock = threading.Lock()
+last_manual_refresh = 0.0      # monotonic timestamp of the last accepted /api/refresh
+_refresh_gate = threading.Lock()
 
 # Live quota cache
 _quota_cache = {"fetched_at": None, "data": None, "error": None}
@@ -106,7 +115,7 @@ def run_query():
         )
         rc = result.returncode
         tail = (result.stderr or result.stdout or "").strip().splitlines()
-        tail = " | ".join(tail[-5:])[:500]
+        tail = _redact(" | ".join(tail[-5:])[:500])
 
         with update_lock:
             last_update_time = started
@@ -151,6 +160,22 @@ def run_query():
     finally:
         with update_lock:
             query_in_progress = False
+
+
+def _redact(text):
+    """Strip the API key out of anything that may reach /api/status.
+
+    last_error carries the tail of the collector's stderr, and /api/status is
+    public. The collector is not supposed to print the key any more, but an
+    upstream error body echoing it back would slip straight through, so this
+    stays as a belt-and-braces filter.
+    """
+    if not text:
+        return text
+    key = os.environ.get("ZHIPUAI_API_KEY", "")
+    if key and len(key) >= 8:
+        text = text.replace(key, "[REDACTED]")
+    return text
 
 
 def scheduler():
@@ -337,6 +362,31 @@ class UsageHandler(SimpleHTTPRequestHandler):
                     {"status": "already_running", **get_status()}, status=409
                 )
                 return
+
+            # Rate limit: at most one manual trigger per REFRESH_MIN_INTERVAL.
+            global last_manual_refresh
+            now = time.monotonic()
+            with _refresh_gate:
+                elapsed = now - last_manual_refresh
+                if last_manual_refresh and elapsed < REFRESH_MIN_INTERVAL:
+                    retry_after = int(REFRESH_MIN_INTERVAL - elapsed) + 1
+                else:
+                    retry_after = 0
+                    last_manual_refresh = now
+
+            if retry_after:
+                self.send_json_response(
+                    {
+                        "status": "rate_limited",
+                        "retry_after_seconds": retry_after,
+                        "min_interval_seconds": REFRESH_MIN_INTERVAL,
+                        **get_status(),
+                    },
+                    status=429,
+                    extra_headers={"Retry-After": str(retry_after)},
+                )
+                return
+
             threading.Thread(target=run_query, daemon=True).start()
             self.send_json_response({"status": "refresh_triggered", **get_status()})
         else:
@@ -381,13 +431,15 @@ class UsageHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_json_response(self, data, status=200):
+    def send_json_response(self, data, status=200, extra_headers=None):
         """Send JSON response (same-origin only; no CORS wildcard)"""
         body = json.dumps(data, default=str).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 

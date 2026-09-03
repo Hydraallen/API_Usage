@@ -80,20 +80,6 @@ if not API_KEY:
 BASE_URL = "https://open.bigmodel.cn"  # CN platform
 
 
-def api_key_preview() -> str:
-    """Masked key for logs and on-disk records.
-
-    Deliberately short: 6 leading + 4 trailing characters. The old 20+10 form
-    revealed 30 characters of a 49-character key — far more than a human needs
-    to tell two keys apart, and far more than belongs in a persisted file.
-    """
-    if not API_KEY:
-        return ""
-    if len(API_KEY) <= 10:
-        return "*" * len(API_KEY)
-    return f"{API_KEY[:6]}...{API_KEY[-4:]}"
-
-
 # ---------------------------------------------------------------------------
 # Token cost estimates (per million tokens, in CNY).
 #
@@ -554,7 +540,10 @@ def main() -> int:
     print("║" + " " * 68 + "║")
     print("╚" + "═" * 68 + "╝")
     print(f"\n📅 查询时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"🔑 API Key: {api_key_preview()}")
+    # Never print any fragment of the key. The dashboard and its /api/*
+    # endpoints are designed to be publicly reachable, and stdout ends up in
+    # `docker logs`; "configured / not configured" is all an operator needs.
+    print(f"🔑 API Key: 已配置 (长度 {len(API_KEY)})" if API_KEY else "🔑 API Key: 未配置")
     print("🌐 平台: CN (open.bigmodel.cn)")
 
     # NOTE: there is deliberately NO chat/completions probe here any more.
@@ -574,7 +563,9 @@ def main() -> int:
 
     all_results = {
         "query_time": datetime.now().isoformat(),
-        "api_key_preview": api_key_preview(),
+        # NOTE: no api_key_preview here, deliberately. usage_history.json is
+        # served verbatim by GET /api/history, which is public and
+        # unauthenticated — nothing derived from the key may be persisted.
         "platform": "CN",
         "partial": ok_count < total_queries,
         "results": {k: to_record(v) for k, v in results.items()},

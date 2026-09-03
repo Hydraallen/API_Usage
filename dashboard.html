@@ -860,6 +860,15 @@
                         lastUpdateTime = status.last_update ? new Date(status.last_update) : null;
                         nextUpdateTime = status.next_update ? new Date(status.next_update) : null;
                         document.getElementById('last-update').textContent = formatTime(status.last_update);
+                    } else if (response.status === 429) {
+                        // Server-side throttle: too soon since the last manual refresh.
+                        // Not an error — show the wait and still re-read the cached data.
+                        const body = await response.json().catch(() => ({}));
+                        const wait = body.retry_after_seconds || body.min_interval_seconds || 60;
+                        document.getElementById('status-text').textContent =
+                            `刷新过于频繁，请 ${wait} 秒后重试`;
+                    } else if (response.status === 409) {
+                        document.getElementById('status-text').textContent = '后台正在更新，请稍候…';
                     }
                 }
 
