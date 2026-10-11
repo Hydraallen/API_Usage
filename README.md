@@ -242,7 +242,7 @@ API_Usage/
 | `DATA_DIR` | ❌ | Docker 下 `/app/data`（宿主侧默认 `./data`），本地为脚本所在目录 | `.env` 与 `usage_history.json` 的存放目录，`server.py` 和 `zhipu_usage.py` 共用 |
 | `HOST_PORT` | ❌ | `8080` | **宿主机**发布端口，只影响 compose 的 `ports` 左半边 |
 | `PORT` | ❌ | `8080` | **容器内**监听端口。一般不要动，改 `HOST_PORT` 就够了 |
-| `TZ` | ❌ | `UTC` | 容器时区，例如 `Asia/Shanghai`。影响日志与 24h 窗口的本地时间显示 |
+| `TZ` | ❌ | `UTC` | 容器时区，例如 `Asia/Shanghai`。影响日志、24h 查询窗口，以及旧历史记录（无时区的时间字符串）按哪个时区解释。**不影响面板显示**：面板固定按北京时间 (UTC+8) 显示。已有历史时不要改动 `TZ`，否则旧记录的时间会被按新时区解释 |
 | `REFRESH_INTERVAL` | ❌ | `15` | 后台采集间隔（分钟），只喂趋势图；页面余额走 `/api/quota/live` |
 | `LIVE_QUOTA_TTL` | ❌ | `60` | `/api/quota/live` 的内存缓存 TTL（秒） |
 
@@ -397,6 +397,23 @@ curl -X POST "http://localhost:8080/api/refresh?user=Bob"
 | 5小时滚动窗口 | Token使用量限制 | 每5小时 |
 | 周度限额 | 每周Token总量 | 每周一 |
 | MCP工具限额 | 搜索/阅读工具次数 | 每月 |
+
+上游 `quota/limit` 接口按账户返回两种配额类型，面板与 `/api/overview` 都支持：
+
+| `type` | 观察到的账户 | 字段 |
+|--------|--------------|------|
+| `TOKENS_LIMIT` | MAX | `unit` / `number` / `percentage` / `nextResetTime` |
+| `CREDIT_LIMIT` | PRO | 另有 `usage`（额度上限）、`currentValue`（已用）、`remaining`（剩余） |
+
+窗口判定：`unit=3, number=5` 为 5 小时窗口，`unit=6, number=1` 为周窗口（两种类型相同）；
+编码未知时按距 `nextResetTime` 的剩余时间判定（≤ 5 小时为 5 小时窗口，≤ 7 天为周窗口）。
+百分比直接使用上游的 `percentage`（整数）；`CREDIT_LIMIT` 另显示「已用 / 上限」。
+
+### 时间显示
+
+面板上所有时间（上次更新、下次更新倒计时、最近采集、趋势图横轴、配额重置时间）一律按
+**北京时间 (UTC+8)** 显示，不随浏览器时区变化。采集器从 1.4.1 起写入带时区偏移的时间
+（如 `2026-10-11T10:01:08+08:00`）；旧记录中不带时区的时间由服务端按容器 `TZ` 补上偏移后再返回。
 
 ### 数据来源
 

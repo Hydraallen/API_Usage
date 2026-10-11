@@ -180,6 +180,66 @@ def load_users(environ: Optional[Dict[str, str]] = None) -> UsersConfig:
     return UsersConfig(users=users, errors=tuple(errors), secrets=tuple(secrets))
 
 
+# ---------------------------------------------------------------------------
+# Quota windows
+#
+# Accounts report their rolling quotas with one of two limit types:
+#   TOKENS_LIMIT  (e.g. MAX accounts)  — percentage only
+#   CREDIT_LIMIT  (e.g. PRO accounts)  — usage = cap, currentValue = used,
+#                                        remaining, percentage
+# Both use the same window codes: unit=3,number=5 -> 5 hours,
+# unit=6,number=1 -> 1 week. When the codes are unknown, the time left until
+# nextResetTime decides (<= 5h -> 5-hour window, <= 7d -> weekly).
+# ---------------------------------------------------------------------------
+QUOTA_LIMIT_TYPES = ("TOKENS_LIMIT", "CREDIT_LIMIT")
+_WINDOW_BY_CODE = {(3, 5): "5h", (6, 1): "week"}
+_FIVE_HOURS_MS = 5 * 3600 * 1000
+_ONE_WEEK_MS = 7 * 24 * 3600 * 1000
+_RESET_SLACK_MS = 10 * 60 * 1000
+
+
+def quota_window(limit: Any, now_ms: Optional[int] = None) -> Optional[str]:
+    """'5h', 'week' or None for one entry of quota_limits.data.limits."""
+    if not isinstance(limit, dict) or limit.get("type") not in QUOTA_LIMIT_TYPES:
+        return None
+    window = _WINDOW_BY_CODE.get((limit.get("unit"), limit.get("number")))
+    if window:
+        return window
+    reset = limit.get("nextResetTime")
+    if not isinstance(reset, (int, float)):
+        return None
+    if now_ms is None:
+        now_ms = int(datetime.now().timestamp() * 1000)
+    left = reset - now_ms
+    if 0 < left <= _FIVE_HOURS_MS + _RESET_SLACK_MS:
+        return "5h"
+    if 0 < left <= _ONE_WEEK_MS + _RESET_SLACK_MS:
+        return "week"
+    return None
+
+
+def now_iso() -> str:
+    """Current local time WITH its UTC offset, e.g. 2026-10-11T10:01:08+08:00."""
+    return datetime.now().astimezone().isoformat()
+
+
+def to_aware_iso(value: Any) -> Any:
+    """Attach the local UTC offset to a naive ISO string; anything else is returned as is.
+
+    Records written before 1.4.1 carry naive local times; the process that
+    wrote them ran in the same container, so the local offset is the right one.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.isoformat()
+
+
 def redact(text: Optional[str], secrets) -> Optional[str]:
     """Replace every known key in `text` with [REDACTED]."""
     if not text:
@@ -444,15 +504,19 @@ def query_quota_limits() -> Dict[str, Any]:
         percentage = limit.get("percentage", 0)
         next_reset = limit.get("nextResetTime", 0)
 
-        if limit_type == "TOKENS_LIMIT":
-            if unit == 3 and number == 5:
-                print("⏱️  5小时 Token 限额:")
-            elif unit == 6 and number == 1:
-                print("📅 周度 Token 限额:")
+        if limit_type in QUOTA_LIMIT_TYPES:
+            kind = "Token" if limit_type == "TOKENS_LIMIT" else "额度"
+            window = quota_window(limit)
+            if window == "5h":
+                print(f"⏱️  5小时 {kind} 限额:")
+            elif window == "week":
+                print(f"📅 周度 {kind} 限额:")
             else:
-                print(f"📦 Token 限额 (Unit {unit}, {number}):")
+                print(f"📦 {kind} 限额 (Unit {unit}, {number}):")
 
             print(f"   {print_progress_bar(percentage)}")
+            if limit_type == "CREDIT_LIMIT":
+                print(f"   已用: {limit.get('currentValue', 0):,} / {limit.get('usage', 0):,}")
             if next_reset:
                 print(f"   重置时间: {format_timestamp(next_reset)} "
                       f"({format_duration(next_reset - int(datetime.now().timestamp() * 1000))} 后)")
@@ -619,7 +683,7 @@ def save_results(all_results: Dict[str, Any], history_name: str = LEGACY_HISTORY
     if len(history["records"]) > 100:
         history["records"] = history["records"][-100:]
 
-    history["last_updated"] = datetime.now().isoformat()
+    history["last_updated"] = now_iso()
     history["total_records"] = len(history["records"])
 
     tmp_fd, tmp_name = tempfile.mkstemp(dir=str(DATA_DIR), prefix=".usage_history.", suffix=".tmp")
@@ -684,7 +748,7 @@ def run_for_user(user: UserConfig) -> int:
     failures = [f"{k}: {v['error']}" for k, v in results.items() if not v["ok"]]
 
     all_results = {
-        "query_time": datetime.now().isoformat(),
+        "query_time": now_iso(),
         # NOTE: no api_key_preview here, deliberately. usage_history.json is
         # served verbatim by GET /api/history, which is public and
         # unauthenticated — nothing derived from the key may be persisted.

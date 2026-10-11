@@ -717,7 +717,7 @@
                             <th>周配额</th>
                             <th>24h Tokens</th>
                             <th class="hide-mobile">等级</th>
-                            <th class="hide-mobile">最近采集</th>
+                            <th class="hide-mobile">最近采集 (UTC+8)</th>
                         </tr>
                     </thead>
                     <tbody id="overview-body"></tbody>
@@ -734,7 +734,7 @@
             </div>
             <div class="status-item">
                 <span>📅</span>
-                <span>上次更新: <strong id="last-update">--</strong></span>
+                <span title="北京时间 (UTC+8)">上次更新: <strong id="last-update">--</strong></span>
             </div>
             <div class="status-item">
                 <span>⏰</span>
@@ -758,7 +758,7 @@
         </div>
 
         <footer>
-            <p>ZhipuAI Usage Monitor © 2026 | 自动刷新间隔: <span id="refresh-interval">15</span> 分钟</p>
+            <p>ZhipuAI Usage Monitor © 2026 | 自动刷新间隔: <span id="refresh-interval">15</span> 分钟 | 时间均为北京时间 (UTC+8)</p>
         </footer>
     </div>
 
@@ -851,32 +851,58 @@
             return `${Math.floor(m / 60)} 小时前`;
         }
 
-        // Format time - converts UTC to local timezone
-        function formatTime(isoString) {
-            if (!isoString) return '--';
-            // Treat as UTC if no timezone specified
-            const date = isoString.endsWith('Z') || isoString.includes('+') 
-                ? new Date(isoString) 
-                : new Date(isoString + 'Z');
-            return date.toLocaleString('zh-CN', {
-                month: '2-digit',
-                day: '2-digit',
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit'
-            });
+        // ------------------------------------------------------------------
+        // Time display: EVERY time on the page is shown in Beijing time
+        // (UTC+8), whatever the browser's own time zone is.
+        //
+        // Sources: server timestamps carry an explicit offset (the server
+        // adds one to legacy naive records); nextResetTime is epoch ms. A
+        // string WITHOUT an offset can still arrive through the static-file
+        // fallback — the collector writes local time and the service runs in
+        // China, so such a string is read as UTC+8, never as UTC or as the
+        // browser's local time.
+        // ------------------------------------------------------------------
+        const DISPLAY_TZ = 'Asia/Shanghai';
+        const NAIVE_TIME_OFFSET = '+08:00';
+        const fullTimeFormat = new Intl.DateTimeFormat('zh-CN', {
+            timeZone: DISPLAY_TZ, month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+        });
+        const shortTimeFormat = new Intl.DateTimeFormat('zh-CN', {
+            timeZone: DISPLAY_TZ, hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+        });
+        const dayTimeFormat = new Intl.DateTimeFormat('zh-CN', {
+            timeZone: DISPLAY_TZ, month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+        });
+
+        // ISO string (with or without offset) or epoch ms -> Date, or null.
+        function parseTime(value) {
+            if (value === null || value === undefined || value === '') return null;
+            if (value instanceof Date) return isNaN(value) ? null : value;
+            if (typeof value === 'number') return new Date(value);
+            const s = String(value);
+            const hasZone = /(Z|[+-]\d{2}:?\d{2})$/i.test(s);
+            const date = new Date(hasZone ? s : s + NAIVE_TIME_OFFSET);
+            return isNaN(date) ? null : date;
         }
 
-        // Format short time (for chart labels) - converts UTC to local timezone
-        function formatShortTime(isoString) {
-            if (!isoString) return '--';
-            // Treat as UTC if no timezone specified
-            const date = isoString.endsWith('Z') || isoString.includes('+') 
-                ? new Date(isoString) 
-                : new Date(isoString + 'Z');
-            const hours = date.getHours().toString().padStart(2, '0');
-            const minutes = date.getMinutes().toString().padStart(2, '0');
-            return `${hours}:${minutes}`;
+        // MM/DD HH:mm:ss in Beijing time
+        function formatTime(value) {
+            const date = parseTime(value);
+            return date ? fullTimeFormat.format(date) : '--';
+        }
+
+        // HH:mm in Beijing time (chart labels)
+        function formatShortTime(value) {
+            const date = parseTime(value);
+            return date ? shortTimeFormat.format(date) : '--';
+        }
+
+        // MM/DD HH:mm in Beijing time (quota reset moments)
+        function formatDayTime(value) {
+            const date = parseTime(value);
+            return date ? dayTimeFormat.format(date) : '--';
         }
 
         // Format remaining time
@@ -913,7 +939,10 @@
         // Update countdown display
         function updateCountdown() {
             if (!nextUpdateTime) {
-                document.getElementById('countdown').textContent = '--';
+                // next_update is null only until the first collection round
+                // has finished for every user.
+                document.getElementById('countdown').textContent =
+                    lastStatus && lastStatus.user ? '首轮采集中' : '--';
                 return;
             }
 
@@ -933,12 +962,14 @@
                 if (response.ok) {
                     const status = await response.json();
                     if (gen !== viewGen) return;
-                    lastUpdateTime = status.last_update ? new Date(status.last_update) : null;
-                    nextUpdateTime = status.next_update ? new Date(status.next_update) : null;
+                    lastUpdateTime = parseTime(status.last_update);
+                    nextUpdateTime = parseTime(status.next_update);
                     refreshIntervalMinutes = status.refresh_interval_minutes || 15;
                     document.getElementById('refresh-interval').textContent = refreshIntervalMinutes;
                     document.getElementById('last-update').textContent = formatTime(status.last_update);
                     lastStatus = status;
+                    // Paint the countdown now instead of waiting for the 1 s timer.
+                    updateCountdown();
                     if (status.last_error) {
                         const dot = document.getElementById('status-dot');
                         const text = document.getElementById('status-text');
@@ -1050,8 +1081,8 @@
                     const response = await fetch(apiUrl('/api/refresh'), { method: 'POST' });
                     if (response.ok) {
                         const status = await response.json();
-                        lastUpdateTime = status.last_update ? new Date(status.last_update) : null;
-                        nextUpdateTime = status.next_update ? new Date(status.next_update) : null;
+                        lastUpdateTime = parseTime(status.last_update);
+                        nextUpdateTime = parseTime(status.next_update);
                         document.getElementById('last-update').textContent = formatTime(status.last_update);
                     } else if (response.status === 429) {
                         // Server-side throttle: too soon since the last manual refresh.
@@ -1143,27 +1174,46 @@
             `;
         }
 
+        // Which rolling window a quota entry describes: '5h', 'week' or null.
+        // Mirrors zhipu_usage.quota_window(): TOKENS_LIMIT and CREDIT_LIMIT
+        // share the codes unit=3,number=5 (5 hours) and unit=6,number=1
+        // (1 week); unknown codes fall back to the time left until reset.
+        const QUOTA_LIMIT_TYPES = ['TOKENS_LIMIT', 'CREDIT_LIMIT'];
+        function quotaWindow(limit) {
+            if (!limit || !QUOTA_LIMIT_TYPES.includes(limit.type)) return null;
+            if (limit.unit === 3 && limit.number === 5) return '5h';
+            if (limit.unit === 6 && limit.number === 1) return 'week';
+            const reset = Number(limit.nextResetTime);
+            if (!isFinite(reset)) return null;
+            const left = reset - Date.now();
+            const slack = 10 * 60 * 1000;
+            if (left > 0 && left <= 5 * 3600 * 1000 + slack) return '5h';
+            if (left > 0 && left <= 7 * 24 * 3600 * 1000 + slack) return 'week';
+            return null;
+        }
+
         // Render just the limit rows (shared by history render and live swap)
         function renderQuotaLimits(limits) {
             let html = '';
             const typeNames = {
                 'TOKENS_LIMIT': '🎫 Token 限额',
+                'CREDIT_LIMIT': '💳 额度限额',
                 'TIME_LIMIT': '🔧 MCP 工具限额'
             };
+            const windowNames = { '5h': '⏱️ 5小时滚动窗口', 'week': '📅 周度限额' };
 
             for (const limit of (limits || [])) {
                 const type = limit.type;
-                const unit = limit.unit;
-                const number = limit.number;
                 // Upstream values: coerce/escape before they reach innerHTML.
                 const percentage = Number(limit.percentage) || 0;
                 const nextReset = limit.nextResetTime;
 
-                let name = typeNames[type] || escapeHtml(type);
-                if (type === 'TOKENS_LIMIT') {
-                    if (unit === 3 && number === 5) name = '⏱️ 5小时滚动窗口';
-                    else if (unit === 6 && number === 1) name = '📅 周度限额';
-                }
+                const window_ = quotaWindow(limit);
+                const name = windowNames[window_] || typeNames[type] || escapeHtml(type);
+                // CREDIT_LIMIT: usage = cap, currentValue = used
+                const credit = type === 'CREDIT_LIMIT' && isFinite(Number(limit.usage))
+                    ? `<span>已用: ${formatNumber(Number(limit.currentValue) || 0)} / ${formatNumber(Number(limit.usage))}</span>`
+                    : '';
 
                 html += `
                     <div class="quota-item">
@@ -1175,7 +1225,8 @@
                             <div class="progress-fill ${getProgressClass(percentage)}" style="width: ${percentage}%"></div>
                         </div>
                         <div class="quota-meta">
-                            <span>${nextReset ? '重置: ' + formatRemaining(nextReset) : ''}</span>
+                            <span>${nextReset ? '重置: ' + formatRemaining(nextReset) + ` (${formatDayTime(nextReset)})` : ''}</span>
+                            ${credit}
                             ${type === 'TIME_LIMIT' ? `<span>剩余: ${formatNumber(limit.remaining || 0)}</span>` : ''}
                         </div>
                     </div>
@@ -1608,6 +1659,11 @@
         // History paints the page immediately (0 latency) while the live
         // balance request runs concurrently and replaces the numbers on arrival.
         async function init() {
+            // Timers start right away: the countdown must not sit on '--'
+            // while a slow live-quota request is still pending.
+            countdownTimer = setInterval(updateCountdown, 1000);
+            freshnessTimer = setInterval(renderFreshness, 1000);
+
             // The user list decides which ?user= every other call carries.
             await loadUsers();
             const overviewPromise = loadOverview();
@@ -1620,12 +1676,6 @@
             });
 
             await Promise.allSettled([historyPromise, livePromise, overviewPromise]);
-
-            // Start countdown timer
-            countdownTimer = setInterval(updateCountdown, 1000);
-
-            // Keep the freshness badge honest between live refreshes
-            freshnessTimer = setInterval(renderFreshness, 1000);
 
             // Live balance stays fresh on its own cadence (server caches 60s)
             setInterval(refreshLiveQuota, 60000);

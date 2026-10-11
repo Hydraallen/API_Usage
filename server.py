@@ -376,16 +376,13 @@ def _quota_numbers(quota_data):
     if not isinstance(quota_data, dict):
         return out
     out["level"] = quota_data.get("level")
+    # TOKENS_LIMIT and CREDIT_LIMIT both count; the first entry per window wins.
     for limit in quota_data.get("limits") or []:
-        if not isinstance(limit, dict) or limit.get("type") != "TOKENS_LIMIT":
-            continue
-        unit, number = limit.get("unit"), limit.get("number")
-        if unit == 3 and number == 5:
-            out["five_hour_pct"] = limit.get("percentage")
-            out["five_hour_reset"] = limit.get("nextResetTime")
-        elif unit == 6 and number == 1:
-            out["weekly_pct"] = limit.get("percentage")
-            out["weekly_reset"] = limit.get("nextResetTime")
+        window = zhipu_usage.quota_window(limit)
+        prefix = {"5h": "five_hour", "week": "weekly"}.get(window)
+        if prefix and out[f"{prefix}_pct"] is None:
+            out[f"{prefix}_pct"] = limit.get("percentage")
+            out[f"{prefix}_reset"] = limit.get("nextResetTime")
     return out
 
 
@@ -413,7 +410,7 @@ def _summarize_history(user):
         results = latest.get("results") or {}
         ql = results.get("quota_limits") or {}
         mu = results.get("model_usage") or {}
-        summary["record_time"] = latest.get("query_time")
+        summary["record_time"] = zhipu_usage.to_aware_iso(latest.get("query_time"))
         if ql.get("ok", True):
             summary.update(_quota_numbers(ql.get("data")))
         if mu.get("ok", True):
@@ -610,6 +607,12 @@ class UsageHandler(SimpleHTTPRequestHandler):
             return
         if isinstance(data, dict):
             data["user"] = user.name
+            # Older records hold naive local times: give every timestamp an
+            # explicit offset so the browser never has to guess.
+            data["last_updated"] = zhipu_usage.to_aware_iso(data.get("last_updated"))
+            for record in data.get("records") or []:
+                if isinstance(record, dict):
+                    record["query_time"] = zhipu_usage.to_aware_iso(record.get("query_time"))
         self.send_json_response(data)
 
     def serve_static(self, filename):
