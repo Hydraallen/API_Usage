@@ -411,7 +411,10 @@ curl -X POST "http://localhost:8080/api/refresh?user=Bob"
 并标注「已用 x / 12,000 积分」，不当作 Token 显示；`TOKENS_LIMIT` 仍显示为「5小时滚动窗口」「周度限额」。
 
 窗口判定：`unit=3, number=5` 为 5 小时窗口，`unit=6, number=1` 为周窗口（两种类型相同）；
-编码未知时按距 `nextResetTime` 的剩余时间判定（≤ 5 小时为 5 小时窗口，≤ 7 天为周窗口）。
+编码未知的条目只能填补**没有任何精确编码条目**的窗口，按距 `nextResetTime` 的剩余时间判定
+（≤ 5 小时为 5 小时窗口，≤ 7 天为周窗口），因此临近重置的周配额不会占用 5 小时列。
+同一窗口有多条时（例如 `TOKENS_LIMIT` 与 `CREDIT_LIMIT` 都是 3/5），总览表与详情卡都取 `CREDIT_LIMIT`
+那一条，详情卡中的其他条目在名称后标注类型（如 `(TOKENS_LIMIT)`）。
 百分比直接使用上游的 `percentage`（整数）；总览表的 5h / 周两列对两种类型都只显示百分比。
 
 ### 时间显示

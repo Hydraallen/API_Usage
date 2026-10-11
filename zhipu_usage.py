@@ -190,8 +190,17 @@ def load_users(environ: Optional[Dict[str, str]] = None) -> UsersConfig:
 #                                     remaining, percentage
 #                                     (Pro observed: 12000 per 5h / 60000 per week)
 # Both use the same window codes: unit=3,number=5 -> 5 hours,
-# unit=6,number=1 -> 1 week. When the codes are unknown, the time left until
-# nextResetTime decides (<= 5h -> 5-hour window, <= 7d -> weekly).
+# unit=6,number=1 -> 1 week.
+#
+# classify_limits() works in two passes:
+#   1. every entry with an exact code gets its window;
+#   2. only for a window that pass 1 left EMPTY, an entry without a known code
+#      may claim it by the time left until nextResetTime (<= 5h -> 5-hour,
+#      <= 7d -> weekly). A weekly quota close to its reset therefore can never
+#      displace a real 3/5 entry.
+# When several entries share a window, CREDIT_LIMIT (the current rules) is the
+# primary one, otherwise the first. Overview, detail card and CLI all use the
+# primary entry. dashboard.html mirrors this in classifyLimits().
 # ---------------------------------------------------------------------------
 QUOTA_LIMIT_TYPES = ("TOKENS_LIMIT", "CREDIT_LIMIT")
 _WINDOW_BY_CODE = {(3, 5): "5h", (6, 1): "week"}
@@ -200,24 +209,60 @@ _ONE_WEEK_MS = 7 * 24 * 3600 * 1000
 _RESET_SLACK_MS = 10 * 60 * 1000
 
 
-def quota_window(limit: Any, now_ms: Optional[int] = None) -> Optional[str]:
-    """'5h', 'week' or None for one entry of quota_limits.data.limits."""
-    if not isinstance(limit, dict) or limit.get("type") not in QUOTA_LIMIT_TYPES:
-        return None
-    window = _WINDOW_BY_CODE.get((limit.get("unit"), limit.get("number")))
-    if window:
-        return window
+def _is_quota_entry(limit: Any) -> bool:
+    return isinstance(limit, dict) and limit.get("type") in QUOTA_LIMIT_TYPES
+
+
+def _window_by_reset(limit: Dict[str, Any], now_ms: int) -> Optional[str]:
     reset = limit.get("nextResetTime")
-    if not isinstance(reset, (int, float)):
+    if isinstance(reset, bool) or not isinstance(reset, (int, float)):
         return None
-    if now_ms is None:
-        now_ms = int(datetime.now().timestamp() * 1000)
     left = reset - now_ms
+    if not left == left:  # NaN
+        return None
     if 0 < left <= _FIVE_HOURS_MS + _RESET_SLACK_MS:
         return "5h"
     if 0 < left <= _ONE_WEEK_MS + _RESET_SLACK_MS:
         return "week"
     return None
+
+
+def classify_limits(limits: Any, now_ms: Optional[int] = None) -> List[Tuple[Optional[str], bool]]:
+    """(window, is_primary) for every entry of quota_limits.data.limits, in order."""
+    entries = list(limits) if isinstance(limits, list) else []
+    if now_ms is None:
+        now_ms = int(datetime.now().timestamp() * 1000)
+
+    windows: List[Optional[str]] = [
+        _WINDOW_BY_CODE.get((e.get("unit"), e.get("number"))) if _is_quota_entry(e) else None
+        for e in entries
+    ]
+    filled = {w for w in windows if w}
+    for i, entry in enumerate(entries):
+        if windows[i] is None and _is_quota_entry(entry):
+            window = _window_by_reset(entry, now_ms)
+            if window and window not in filled:
+                windows[i] = window
+
+    primary: Dict[str, int] = {}
+    for i, window in enumerate(windows):
+        if window is None:
+            continue
+        current = primary.get(window)
+        if current is None or (entries[i].get("type") == "CREDIT_LIMIT"
+                               and entries[current].get("type") != "CREDIT_LIMIT"):
+            primary[window] = i
+    return [(w, w is not None and primary.get(w) == i) for i, w in enumerate(windows)]
+
+
+def primary_limits(limits: Any, now_ms: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
+    """{'5h': entry, 'week': entry} — the one entry per window every view shows."""
+    entries = list(limits) if isinstance(limits, list) else []
+    return {
+        window: entries[i]
+        for i, (window, is_primary) in enumerate(classify_limits(entries, now_ms))
+        if is_primary
+    }
 
 
 def now_iso() -> str:
@@ -499,26 +544,36 @@ def query_quota_limits() -> Dict[str, Any]:
     print(f"\n🏷️  账户等级: {str(level).upper()}")
     print()
 
-    for limit in limits:
+    for limit, (window, is_primary) in zip(limits, classify_limits(limits)):
         limit_type = limit.get("type", "Unknown")
         unit = limit.get("unit", 0)
         number = limit.get("number", 0)
         percentage = limit.get("percentage", 0)
         next_reset = limit.get("nextResetTime", 0)
+        # json.loads accepts NaN/Infinity: drop anything that is not a sane ms value.
+        if isinstance(next_reset, bool) or not isinstance(next_reset, (int, float)) \
+                or not (0 < next_reset < 8.64e15):
+            next_reset = 0
 
         if limit_type in QUOTA_LIMIT_TYPES:
-            window = quota_window(limit)
             if limit_type == "TOKENS_LIMIT":
                 titles = {"5h": "⏱️  5小时 Token 限额:", "week": "📅 周度 Token 限额:"}
                 fallback = f"📦 Token 限额 (Unit {unit}, {number}):"
             else:
                 titles = {"5h": "⏱️  5小时积分额度:", "week": "📅 每周积分额度:"}
                 fallback = f"💳 积分额度 (Unit {unit}, {number}):"
-            print(titles.get(window, fallback))
+            title = titles.get(window, fallback)
+            if window and not is_primary:
+                title = f"{title[:-1]} ({limit_type}):"
+            print(title)
 
             print(f"   {print_progress_bar(percentage)}")
             if limit_type == "CREDIT_LIMIT":
-                print(f"   已用: {limit.get('currentValue', 0):,} / {limit.get('usage', 0):,} 积分")
+                used, cap = limit.get("currentValue"), limit.get("usage")
+                if isinstance(cap, (int, float)) and cap > 0:
+                    print(f"   已用: {used or 0:,} / {cap:,} 积分")
+                elif isinstance(used, (int, float)):
+                    print(f"   已用: {used:,} 积分")
             if next_reset:
                 print(f"   重置时间: {format_timestamp(next_reset)} "
                       f"({format_duration(next_reset - int(datetime.now().timestamp() * 1000))} 后)")

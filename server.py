@@ -376,11 +376,11 @@ def _quota_numbers(quota_data):
     if not isinstance(quota_data, dict):
         return out
     out["level"] = quota_data.get("level")
-    # TOKENS_LIMIT and CREDIT_LIMIT both count; the first entry per window wins.
-    for limit in quota_data.get("limits") or []:
-        window = zhipu_usage.quota_window(limit)
-        prefix = {"5h": "five_hour", "week": "weekly"}.get(window)
-        if prefix and out[f"{prefix}_pct"] is None:
+    # Same primary entry per window as the detail card (CREDIT_LIMIT first).
+    primary = zhipu_usage.primary_limits(quota_data.get("limits"))
+    for window, prefix in (("5h", "five_hour"), ("week", "weekly")):
+        limit = primary.get(window)
+        if limit is not None:
             out[f"{prefix}_pct"] = limit.get("percentage")
             out[f"{prefix}_reset"] = limit.get("nextResetTime")
     return out

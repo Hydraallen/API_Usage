@@ -184,6 +184,12 @@
             gap: 8px;
         }
 
+        .quota-label .limit-type {
+            color: #888;
+            font-size: 0.75rem;
+            font-weight: normal;
+        }
+
         .quota-label .percentage {
             font-weight: 600;
             font-size: 1.1rem;
@@ -894,7 +900,11 @@
         function parseTime(value) {
             if (value === null || value === undefined || value === '') return null;
             if (value instanceof Date) return isNaN(value) ? null : value;
-            if (typeof value === 'number') return new Date(value);
+            if (typeof value === 'number') {
+                // Outside ±8.64e15 ms Date is invalid and Intl.format throws
+                // RangeError, which would abort the whole render.
+                return isFinite(value) && Math.abs(value) <= 8.64e15 ? new Date(value) : null;
+            }
             const s = String(value);
             const hasZone = /(Z|[+-]\d{2}:?\d{2})$/i.test(s);
             const date = new Date(hasZone ? s : s + NAIVE_TIME_OFFSET);
@@ -1193,21 +1203,48 @@
         }
 
         // Which rolling window a quota entry describes: '5h', 'week' or null.
-        // Mirrors zhipu_usage.quota_window(): TOKENS_LIMIT and CREDIT_LIMIT
+        // Mirrors zhipu_usage.classify_limits(). TOKENS_LIMIT and CREDIT_LIMIT
         // share the codes unit=3,number=5 (5 hours) and unit=6,number=1
-        // (1 week); unknown codes fall back to the time left until reset.
+        // (1 week). Pass 1 assigns exact codes; pass 2 lets an entry without a
+        // known code claim a window by its reset time ONLY if pass 1 left that
+        // window empty. Per window the primary entry is CREDIT_LIMIT, else the
+        // first one. Returns [{ window, primary }] in input order.
         const QUOTA_LIMIT_TYPES = ['TOKENS_LIMIT', 'CREDIT_LIMIT'];
-        function quotaWindow(limit) {
-            if (!limit || !QUOTA_LIMIT_TYPES.includes(limit.type)) return null;
+        function windowByCode(limit) {
             if (limit.unit === 3 && limit.number === 5) return '5h';
             if (limit.unit === 6 && limit.number === 1) return 'week';
-            const reset = Number(limit.nextResetTime);
-            if (!isFinite(reset)) return null;
-            const left = reset - Date.now();
+            return null;
+        }
+        function windowByReset(limit, now) {
+            const reset = limit.nextResetTime;
+            if (typeof reset !== 'number' || !isFinite(reset)) return null;
+            const left = reset - now;
             const slack = 10 * 60 * 1000;
             if (left > 0 && left <= 5 * 3600 * 1000 + slack) return '5h';
             if (left > 0 && left <= 7 * 24 * 3600 * 1000 + slack) return 'week';
             return null;
+        }
+        function classifyLimits(limits) {
+            const list = Array.isArray(limits) ? limits : [];
+            const isQuota = l => !!l && QUOTA_LIMIT_TYPES.includes(l.type);
+            const windows = list.map(l => isQuota(l) ? windowByCode(l) : null);
+            const filled = new Set(windows.filter(Boolean));
+            const now = Date.now();
+            list.forEach((l, i) => {
+                if (windows[i] === null && isQuota(l)) {
+                    const w = windowByReset(l, now);
+                    if (w && !filled.has(w)) windows[i] = w;
+                }
+            });
+            const primary = {};
+            windows.forEach((w, i) => {
+                if (!w) return;
+                const cur = primary[w];
+                if (cur === undefined || (list[i].type === 'CREDIT_LIMIT' && list[cur].type !== 'CREDIT_LIMIT')) {
+                    primary[w] = i;
+                }
+            });
+            return windows.map((w, i) => ({ window: w, primary: !!w && primary[w] === i }));
         }
 
         // Render just the limit rows (shared by history render and live swap)
@@ -1226,18 +1263,31 @@
                 'CREDIT_LIMIT': { '5h': '⏱️ 5小时积分额度', 'week': '📅 每周积分额度' }
             };
 
-            for (const limit of (limits || [])) {
+            const list = Array.isArray(limits) ? limits : [];
+            const classes = classifyLimits(list);
+            list.forEach((limit, i) => {
+                if (!limit || typeof limit !== 'object') return;
                 const type = limit.type;
                 // Upstream values: coerce/escape before they reach innerHTML.
                 const percentage = Number(limit.percentage) || 0;
                 const nextReset = limit.nextResetTime;
 
-                const window_ = quotaWindow(limit);
-                const name = (windowNames[type] || {})[window_] || typeNames[type] || escapeHtml(type);
-                // CREDIT_LIMIT: usage = point cap, currentValue = points used
-                const credit = type === 'CREDIT_LIMIT' && isFinite(Number(limit.usage))
-                    ? `<span>已用 ${formatInteger(limit.currentValue)} / ${formatInteger(limit.usage)} 积分</span>`
-                    : '';
+                const { window: window_, primary } = classes[i];
+                let name = (windowNames[type] || {})[window_] || typeNames[type] || escapeHtml(type);
+                // A second entry for an already-covered window: tag it with its
+                // type so the card never shows two rows with the same name.
+                if (window_ && !primary) name += ` <small class="limit-type">(${escapeHtml(type)})</small>`;
+                // CREDIT_LIMIT: usage = point cap, currentValue = points used.
+                // Without a positive cap show only the amount used (never "x / 0").
+                const cap = Number(limit.usage);
+                const used = Number(limit.currentValue);
+                let credit = '';
+                if (type === 'CREDIT_LIMIT' && limit.usage !== null && isFinite(cap) && cap > 0) {
+                    credit = `<span>已用 ${formatInteger(isFinite(used) ? used : 0)} / ${formatInteger(cap)} 积分</span>`;
+                } else if (type === 'CREDIT_LIMIT' && limit.currentValue !== null && isFinite(used)) {
+                    credit = `<span>已用 ${formatInteger(used)} 积分</span>`;
+                }
+                const resetAt = parseTime(nextReset);
 
                 html += `
                     <div class="quota-item">
@@ -1249,13 +1299,13 @@
                             <div class="progress-fill ${getProgressClass(percentage)}" style="width: ${percentage}%"></div>
                         </div>
                         <div class="quota-meta">
-                            <span>${nextReset ? '重置: ' + formatRemaining(nextReset) + ` (${formatDayTime(nextReset)})` : ''}</span>
+                            <span>${resetAt ? '重置: ' + formatRemaining(resetAt.getTime()) + ` (${formatDayTime(resetAt)})` : ''}</span>
                             ${credit}
                             ${type === 'TIME_LIMIT' ? `<span>剩余: ${formatNumber(limit.remaining || 0)}</span>` : ''}
                         </div>
                     </div>
                 `;
-            }
+            });
 
             if (!html) {
                 html = '<div class="quota-meta"><span>暂无配额数据</span></div>';
