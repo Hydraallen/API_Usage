@@ -4,19 +4,23 @@ ZhipuAI Usage Monitor Server
 - HTTP server for dashboard and API
 - Background scheduler for auto-refresh (every 15 minutes, history/trend only)
 - On-demand live quota endpoint so the page shows a fresh balance instantly
+- Multi-user: every user has its own history file, status, live-quota cache,
+  refresh throttle and in-progress guard. Users are selected with ?user=NAME;
+  without it the first configured user is used (backward compatible).
 """
 
 import os
 import json
+import sys
 import time
 import threading
 import subprocess
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -27,16 +31,15 @@ REFRESH_INTERVAL = int(os.environ.get("REFRESH_INTERVAL", 15)) * 60  # minutes t
 APP_DIR = Path(os.environ.get("APP_DIR", "/app"))
 DATA_DIR = Path(os.environ.get("DATA_DIR") or (APP_DIR / "data"))
 SCRIPT_PATH = APP_DIR / "zhipu_usage.py"
-HISTORY_FILE = DATA_DIR / "usage_history.json"
 
 # Live quota cache TTL (seconds)
 LIVE_QUOTA_TTL = int(os.environ.get("LIVE_QUOTA_TTL", 60))
 
-# Minimum spacing between two manual POST /api/refresh triggers (seconds).
-# /api/refresh is public and unauthenticated by design, so it needs a throttle
-# of its own: without one anybody could drive the upstream query loop as fast
-# as they can issue requests. This is distinct from the 409 concurrency guard —
-# 429 means "too soon", 409 means "one is running right now".
+# Minimum spacing between two manual POST /api/refresh triggers (seconds),
+# per user. /api/refresh is public and unauthenticated by design, so it needs a
+# throttle of its own: without one anybody could drive the upstream query loop
+# as fast as they can issue requests. This is distinct from the 409 concurrency
+# guard — 429 means "too soon", 409 means "one is running right now".
 REFRESH_MIN_INTERVAL = int(os.environ.get("REFRESH_MIN_INTERVAL", 60))
 QUOTA_ENDPOINT = "/api/monitor/usage/quota/limit"
 
@@ -48,23 +51,11 @@ STATIC_WHITELIST = {
     "/dashboard.html": "dashboard.html",
     "/favicon.ico": "favicon.ico",
 }
+API_PATHS = ("/api/status", "/api/history", "/api/quota/live", "/api/users", "/api/overview")
 
-# ---------------------------------------------------------------------------
-# Global state
-# ---------------------------------------------------------------------------
-last_update_time = None        # last ATTEMPT (success or failure)
-last_success_time = None       # last time the query actually succeeded
-next_update_time = None
-last_error = None
-consecutive_failures = 0
-query_in_progress = False
-update_lock = threading.Lock()
-last_manual_refresh = 0.0      # monotonic timestamp of the last accepted /api/refresh
-_refresh_gate = threading.Lock()
-
-# Live quota cache
-_quota_cache = {"fetched_at": None, "data": None, "error": None}
-_quota_lock = threading.Lock()
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+import zhipu_usage  # noqa: E402  (no side effects beyond reading .env)
 
 
 def load_env():
@@ -84,164 +75,204 @@ def log(msg):
 
 
 # ---------------------------------------------------------------------------
+# Per-user state
+# ---------------------------------------------------------------------------
+class UserState:
+    """Everything that used to be a module global, now one instance per user."""
+
+    def __init__(self, cfg):
+        self.name = cfg.name
+        self.key = cfg.key
+        self.history_file = DATA_DIR / cfg.history_name
+
+        self.lock = threading.Lock()
+        self.last_update_time = None    # last ATTEMPT (success or failure)
+        self.last_success_time = None   # last time the query actually succeeded
+        self.next_update_time = None
+        self.last_error = None
+        self.consecutive_failures = 0
+        self.query_in_progress = False
+
+        self.refresh_gate = threading.Lock()
+        self.last_manual_refresh = 0.0  # monotonic timestamp of the last accepted /api/refresh
+
+        self.quota_lock = threading.Lock()
+        self.quota_cache = {"fetched_at": None, "data": None, "error": None}
+
+        self.summary_lock = threading.Lock()
+        self.summary_cache = (None, None)  # (history mtime, summary dict)
+
+
+USERS = {}          # name -> UserState, in configuration order
+CONFIG_ERRORS = ()  # human-readable, key-free
+SECRETS = ()        # every key seen in the configuration, for redaction
+
+
+def configure_users():
+    global USERS, CONFIG_ERRORS, SECRETS
+    config = zhipu_usage.load_users()
+    USERS = {u.name: UserState(u) for u in config.users}
+    CONFIG_ERRORS = config.errors
+    SECRETS = config.secrets
+
+
+def default_user():
+    return next(iter(USERS.values()), None)
+
+
+def _redact(text):
+    """Strip every configured API key out of anything that may leave the server.
+
+    last_error carries the tail of the collector's stderr, and /api/status is
+    public. The collector is not supposed to print a key, but an upstream error
+    body echoing one back would slip straight through, so this stays as a
+    belt-and-braces filter — over ALL keys, not just the current user's.
+    """
+    return zhipu_usage.redact(text, SECRETS)
+
+
+# ---------------------------------------------------------------------------
 # Scheduled query (history / trend only — NOT the page's freshness path)
 # ---------------------------------------------------------------------------
-def run_query():
-    """Run the usage query script.
+def run_query(user):
+    """Run the usage query script for one user.
 
     Exit-code contract with zhipu_usage.py:
         0 -> all endpoints succeeded, history written
         2 -> partial success, history written with "partial": true
         1 -> everything failed, NOTHING written to history
-    """
-    global last_update_time, next_update_time, last_success_time
-    global last_error, consecutive_failures, query_in_progress
 
-    with update_lock:
-        if query_in_progress:
-            log("Query already running, skipping this trigger")
+    The key is never put on argv (visible in `ps`): the child inherits the
+    environment and picks its own key by --user NAME.
+    """
+    with user.lock:
+        if user.query_in_progress:
+            log(f"[{user.name}] Query already running, skipping this trigger")
             return False
-        query_in_progress = True
+        user.query_in_progress = True
 
     started = datetime.now(timezone.utc)
+    child_env = dict(os.environ, DATA_DIR=str(DATA_DIR))
     try:
-        log("Running usage query...")
+        log(f"[{user.name}] Running usage query...")
         result = subprocess.run(
-            ["python3", str(SCRIPT_PATH)],
+            ["python3", str(SCRIPT_PATH), "--user", user.name],
             capture_output=True,
             text=True,
             timeout=60,
             cwd=str(APP_DIR),
+            env=child_env,
         )
         rc = result.returncode
         tail = (result.stderr or result.stdout or "").strip().splitlines()
         tail = _redact(" | ".join(tail[-5:])[:500])
 
-        with update_lock:
-            last_update_time = started
-            next_update_time = started + timedelta(seconds=REFRESH_INTERVAL)
+        with user.lock:
+            user.last_update_time = started
+            user.next_update_time = started + timedelta(seconds=REFRESH_INTERVAL)
             if rc == 0:
-                last_success_time = started
-                last_error = None
-                consecutive_failures = 0
+                user.last_success_time = started
+                user.last_error = None
+                user.consecutive_failures = 0
             elif rc == 2:
                 # Partial: a record WAS written, but some endpoints failed.
-                last_success_time = started
-                last_error = f"partial (rc=2): {tail}"
-                consecutive_failures = 0
+                user.last_success_time = started
+                user.last_error = f"partial (rc=2): {tail}"
+                user.consecutive_failures = 0
             else:
-                last_error = f"query failed (rc={rc}): {tail}"
-                consecutive_failures += 1
+                user.last_error = f"query failed (rc={rc}): {tail}"
+                user.consecutive_failures += 1
 
         if rc == 0:
-            log("Query completed successfully")
+            log(f"[{user.name}] Query completed successfully")
         elif rc == 2:
-            log(f"Query completed PARTIALLY: {tail}")
+            log(f"[{user.name}] Query completed PARTIALLY: {tail}")
         else:
-            log(f"Query FAILED (rc={rc}): {tail}")
+            log(f"[{user.name}] Query FAILED (rc={rc}): {tail}")
         return rc in (0, 2)
 
     except subprocess.TimeoutExpired:
-        with update_lock:
-            last_update_time = started
-            next_update_time = started + timedelta(seconds=REFRESH_INTERVAL)
-            last_error = "query timed out after 60s"
-            consecutive_failures += 1
-        log("Query FAILED: timeout after 60s")
+        with user.lock:
+            user.last_update_time = started
+            user.next_update_time = started + timedelta(seconds=REFRESH_INTERVAL)
+            user.last_error = "query timed out after 60s"
+            user.consecutive_failures += 1
+        log(f"[{user.name}] Query FAILED: timeout after 60s")
         return False
     except Exception as e:
-        with update_lock:
-            last_update_time = started
-            next_update_time = started + timedelta(seconds=REFRESH_INTERVAL)
-            last_error = f"query error: {e}"
-            consecutive_failures += 1
-        log(f"Query ERROR: {e}")
+        msg = _redact(f"query error: {e}")
+        with user.lock:
+            user.last_update_time = started
+            user.next_update_time = started + timedelta(seconds=REFRESH_INTERVAL)
+            user.last_error = msg
+            user.consecutive_failures += 1
+        log(f"[{user.name}] Query ERROR: {msg}")
         return False
     finally:
-        with update_lock:
-            query_in_progress = False
+        with user.lock:
+            user.query_in_progress = False
 
 
-def _redact(text):
-    """Strip the API key out of anything that may reach /api/status.
-
-    last_error carries the tail of the collector's stderr, and /api/status is
-    public. The collector is not supposed to print the key any more, but an
-    upstream error body echoing it back would slip straight through, so this
-    stays as a belt-and-braces filter.
-    """
-    if not text:
-        return text
-    key = os.environ.get("ZHIPUAI_API_KEY", "")
-    if key and len(key) >= 8:
-        text = text.replace(key, "[REDACTED]")
-    return text
+def run_all_users():
+    """Collect every user one after another (serial: never hammer upstream)."""
+    for user in list(USERS.values()):
+        run_query(user)
 
 
 def scheduler():
     """Background scheduler for auto-refresh (15 min by default)"""
     while True:
         time.sleep(REFRESH_INTERVAL)
-        run_query()
+        run_all_users()
 
 
-def get_status():
-    """Get current status"""
-    with update_lock:
+def _iso(dt):
+    return dt.isoformat() if dt else None
+
+
+def get_status(user):
+    """Get current status of one user (or a placeholder when none configured)."""
+    common = {
+        "refresh_interval": REFRESH_INTERVAL,
+        "refresh_interval_minutes": REFRESH_INTERVAL // 60,
+        "users": list(USERS),
+    }
+    if user is None:
         return {
-            "last_update": last_update_time.isoformat() if last_update_time else None,
-            "last_success_time": last_success_time.isoformat() if last_success_time else None,
-            "next_update": next_update_time.isoformat() if next_update_time else None,
-            "last_error": last_error,
-            "consecutive_failures": consecutive_failures,
-            "healthy": consecutive_failures == 0 and last_error is None,
-            "query_in_progress": query_in_progress,
-            "refresh_interval": REFRESH_INTERVAL,
-            "refresh_interval_minutes": REFRESH_INTERVAL // 60,
+            "user": None,
+            "last_update": None,
+            "last_success_time": None,
+            "next_update": None,
+            "last_error": "未配置任何 API Key（ZHIPUAI_API_KEYS / ZHIPUAI_API_KEY）",
+            "consecutive_failures": 0,
+            "healthy": False,
+            "query_in_progress": False,
+            **common,
+        }
+    with user.lock:
+        return {
+            "user": user.name,
+            "last_update": _iso(user.last_update_time),
+            "last_success_time": _iso(user.last_success_time),
+            "next_update": _iso(user.next_update_time),
+            "last_error": user.last_error,
+            "consecutive_failures": user.consecutive_failures,
+            "healthy": user.consecutive_failures == 0 and user.last_error is None,
+            "query_in_progress": user.query_in_progress,
+            **common,
         }
 
 
 # ---------------------------------------------------------------------------
-# Live quota (on-demand, 60s TTL) — this is what makes the page fresh
+# Live quota (on-demand, 60s TTL per user) — this is what makes the page fresh
 # ---------------------------------------------------------------------------
-_zhipu_mod = None
-_zhipu_mod_error = None
-
-
-def _query_helpers():
-    """Lazily import zhipu_usage for BASE_URL / API_KEY / parse_envelope.
-
-    Imported lazily on purpose: the module exits at import time when
-    ZHIPUAI_API_KEY is missing, and we want that to become a JSON error on one
-    endpoint instead of killing the whole server at boot.
-    """
-    global _zhipu_mod, _zhipu_mod_error
-    if _zhipu_mod is not None or _zhipu_mod_error is not None:
-        return _zhipu_mod, _zhipu_mod_error
-    try:
-        import importlib
-        import sys
-        if str(APP_DIR) not in sys.path:
-            sys.path.insert(0, str(APP_DIR))
-        _zhipu_mod = importlib.import_module("zhipu_usage")
-    except SystemExit:
-        _zhipu_mod_error = "ZHIPUAI_API_KEY 未配置 (.env 缺失或为空)"
-    except Exception as e:
-        _zhipu_mod_error = f"无法加载查询模块: {e}"
-    return _zhipu_mod, _zhipu_mod_error
-
-
-def fetch_live_quota():
+def fetch_live_quota(user):
     """Hit the single read-only quota endpoint. Returns (ok, data, error)."""
-    mod, mod_err = _query_helpers()
-    if mod is None:
-        return False, None, mod_err
-
-    url = f"{mod.BASE_URL}{QUOTA_ENDPOINT}"
+    url = f"{zhipu_usage.BASE_URL}{QUOTA_ENDPOINT}"
     req = urllib.request.Request(
         url,
         headers={
-            "Authorization": mod.API_KEY,  # No "Bearer" prefix!
+            "Authorization": user.key,  # No "Bearer" prefix!
             "Accept-Language": "en-US,en",
             "Content-Type": "application/json",
         },
@@ -255,59 +286,147 @@ def fetch_live_quota():
         raw = e.read().decode("utf-8", "replace") if e.fp else ""
         status = e.code
     except Exception as e:
-        return False, None, f"上游请求失败: {e}"
+        return False, None, _redact(f"上游请求失败: {e}")
 
     try:
         payload = json.loads(raw)
     except ValueError:
         payload = raw
 
-    return mod.parse_envelope(status, payload)
+    ok, data, error = zhipu_usage.parse_envelope(status, payload)
+    return ok, data, _redact(error)
 
 
-def get_live_quota(force=False):
-    """Cached live quota. 60s TTL; cache hits are flagged with cached: true."""
-    now = time.time()
-    with _quota_lock:
-        fetched_at = _quota_cache["fetched_at"]
-        if not force and fetched_at is not None and (now - fetched_at) < LIVE_QUOTA_TTL:
-            age = now - fetched_at
-            if _quota_cache["data"] is not None:
-                return {
-                    "ok": True,
-                    "cached": True,
-                    "age_seconds": round(age, 1),
-                    "ttl_seconds": LIVE_QUOTA_TTL,
-                    "fetched_at": datetime.fromtimestamp(fetched_at, timezone.utc).isoformat(),
-                    "data": _quota_cache["data"],
-                    "error": None,
-                }
-            return {
-                "ok": False,
-                "cached": True,
-                "age_seconds": round(age, 1),
-                "ttl_seconds": LIVE_QUOTA_TTL,
-                "fetched_at": datetime.fromtimestamp(fetched_at, timezone.utc).isoformat(),
-                "data": None,
-                "error": _quota_cache["error"],
-            }
-
-    ok, data, error = fetch_live_quota()
-    fetched = time.time()
-    with _quota_lock:
-        _quota_cache["fetched_at"] = fetched
-        _quota_cache["data"] = data if ok else None
-        _quota_cache["error"] = None if ok else error
-
+def _quota_payload(ok, cached, fetched_at, data, error, now):
     return {
         "ok": ok,
-        "cached": False,
-        "age_seconds": 0.0,
+        "cached": cached,
+        "age_seconds": round(now - fetched_at, 1),
         "ttl_seconds": LIVE_QUOTA_TTL,
-        "fetched_at": datetime.fromtimestamp(fetched, timezone.utc).isoformat(),
-        "data": data if ok else None,
-        "error": None if ok else error,
+        "fetched_at": datetime.fromtimestamp(fetched_at, timezone.utc).isoformat(),
+        "data": data,
+        "error": error,
     }
+
+
+def get_live_quota(user, force=False):
+    """Cached live quota. 60s TTL; cache hits are flagged with cached: true."""
+    now = time.time()
+    with user.quota_lock:
+        cache = user.quota_cache
+        fetched_at = cache["fetched_at"]
+        if not force and fetched_at is not None and (now - fetched_at) < LIVE_QUOTA_TTL:
+            ok = cache["data"] is not None
+            payload = _quota_payload(ok, True, fetched_at, cache["data"], cache["error"], now)
+            payload["user"] = user.name
+            return payload
+
+    ok, data, error = fetch_live_quota(user)
+    fetched = time.time()
+    with user.quota_lock:
+        user.quota_cache = {
+            "fetched_at": fetched,
+            "data": data if ok else None,
+            "error": None if ok else error,
+        }
+    payload = _quota_payload(ok, False, fetched, data if ok else None, None if ok else error, fetched)
+    payload["user"] = user.name
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Overview (one row per user, built from cheap local state only)
+# ---------------------------------------------------------------------------
+def _quota_numbers(quota_data):
+    """Pull level / 5h % / weekly % out of a quota_limits payload."""
+    out = {"level": None, "five_hour_pct": None, "five_hour_reset": None,
+           "weekly_pct": None, "weekly_reset": None}
+    if not isinstance(quota_data, dict):
+        return out
+    out["level"] = quota_data.get("level")
+    for limit in quota_data.get("limits") or []:
+        if not isinstance(limit, dict) or limit.get("type") != "TOKENS_LIMIT":
+            continue
+        unit, number = limit.get("unit"), limit.get("number")
+        if unit == 3 and number == 5:
+            out["five_hour_pct"] = limit.get("percentage")
+            out["five_hour_reset"] = limit.get("nextResetTime")
+        elif unit == 6 and number == 1:
+            out["weekly_pct"] = limit.get("percentage")
+            out["weekly_reset"] = limit.get("nextResetTime")
+    return out
+
+
+def _summarize_history(user):
+    """Summary of the newest history record, cached on the file's mtime."""
+    try:
+        mtime = user.history_file.stat().st_mtime
+    except OSError:
+        return {"record_time": None, "history_error": "暂无历史数据"}
+
+    with user.summary_lock:
+        cached_mtime, cached = user.summary_cache
+        if cached_mtime == mtime:
+            return cached
+
+    try:
+        with open(user.history_file, "r", encoding="utf-8") as f:
+            records = json.load(f).get("records") or []
+    except (OSError, ValueError, AttributeError) as e:
+        return {"record_time": None, "history_error": f"历史文件读取失败: {type(e).__name__}"}
+
+    summary = {"record_time": None, "history_error": None if records else "暂无历史数据"}
+    if records:
+        latest = records[-1]
+        results = latest.get("results") or {}
+        ql = results.get("quota_limits") or {}
+        mu = results.get("model_usage") or {}
+        summary["record_time"] = latest.get("query_time")
+        if ql.get("ok", True):
+            summary.update(_quota_numbers(ql.get("data")))
+        if mu.get("ok", True):
+            total = (mu.get("data") or {}).get("totalUsage") or {}
+            summary["tokens_24h"] = total.get("totalTokensUsage")
+            summary["calls_24h"] = total.get("totalModelCallCount")
+
+    with user.summary_lock:
+        user.summary_cache = (mtime, summary)
+    return summary
+
+
+def get_overview():
+    rows = []
+    for user in list(USERS.values()):
+        row = {"user": user.name, "level": None, "five_hour_pct": None, "five_hour_reset": None,
+               "weekly_pct": None, "weekly_reset": None, "tokens_24h": None, "calls_24h": None,
+               "quota_source": None}
+        hist = _summarize_history(user)
+        row.update(hist)
+        if row["five_hour_pct"] is not None or row["weekly_pct"] is not None:
+            row["quota_source"] = "history"
+
+        # Prefer the live cache when it already holds something newer. This
+        # never triggers an upstream call by itself.
+        with user.quota_lock:
+            live_at, live_data = user.quota_cache["fetched_at"], user.quota_cache["data"]
+        if live_data is not None:
+            live_dt = datetime.fromtimestamp(live_at, timezone.utc)
+            rec = row.get("record_time")
+            try:
+                rec_dt = datetime.fromisoformat(rec).astimezone(timezone.utc) if rec else None
+            except ValueError:
+                rec_dt = None
+            if rec_dt is None or live_dt > rec_dt:
+                row.update(_quota_numbers(live_data))
+                row["quota_source"] = "live"
+                row["quota_time"] = live_dt.isoformat()
+
+        status = get_status(user)
+        row.update({k: status[k] for k in
+                    ("healthy", "last_error", "last_success_time", "consecutive_failures",
+                     "query_in_progress")})
+        rows.append(row)
+    return {"users": rows, "default": rows[0]["user"] if rows else None}
 
 
 # ---------------------------------------------------------------------------
@@ -319,17 +438,57 @@ class UsageHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(APP_DIR), **kwargs)
 
+    def resolve_user(self, parsed, allow_none=False):
+        """?user=NAME -> UserState. Sends the error response and returns None on failure.
+
+        No ?user= means the first configured user (backward compatible).
+        """
+        names = parse_qs(parsed.query).get("user")
+        name = names[0] if names else ""
+        if not name:
+            user = default_user()
+            if user is None and not allow_none:
+                self.send_json_response({"error": "未配置任何 API Key"}, status=503)
+            return user
+        if not zhipu_usage.USER_NAME_RE.match(name):
+            self.send_json_response({"error": "user 参数不合法"}, status=400)
+            return None
+        user = USERS.get(name)
+        if user is None:
+            self.send_json_response({"error": "用户不存在", "users": list(USERS)}, status=404)
+        return user
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
 
         if path == "/api/status":
-            self.send_json_response(get_status())
+            # Healthcheck target: with no ?user= it must answer 200 even when
+            # nothing is configured.
+            has_param = bool(parse_qs(parsed.query).get("user"))
+            user = self.resolve_user(parsed, allow_none=True)
+            if user is None and has_param:
+                return
+            self.send_json_response(get_status(user))
+        elif path == "/api/users":
+            self.send_json_response({
+                "users": [{"name": n, "is_default": i == 0} for i, n in enumerate(USERS)],
+                "default": next(iter(USERS), None),
+                "config_errors": list(CONFIG_ERRORS),
+            })
+        elif path == "/api/overview":
+            self.send_json_response(get_overview())
         elif path == "/api/quota/live":
-            payload = get_live_quota()
+            user = self.resolve_user(parsed)
+            if user is None:
+                return
+            payload = get_live_quota(user)
             self.send_json_response(payload, status=200 if payload["ok"] else 502)
         elif path == "/api/history":
-            self.serve_history()
+            user = self.resolve_user(parsed)
+            if user is None:
+                return
+            self.serve_history(user)
         elif path in ("/", "/index.html", "/dashboard.html"):
             self.serve_static("dashboard.html")
         elif path in STATIC_WHITELIST:
@@ -343,7 +502,7 @@ class UsageHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path in ("/", "/index.html", "/dashboard.html") or path in STATIC_WHITELIST \
-                or path in ("/api/status", "/api/history", "/api/quota/live"):
+                or path in API_PATHS:
             self.send_response(200)
             self.send_header("Content-Type", "text/html" if not path.startswith("/api/") else "application/json")
             self.end_headers()
@@ -355,24 +514,26 @@ class UsageHandler(SimpleHTTPRequestHandler):
         path = parsed.path
 
         if path == "/api/refresh":
-            with update_lock:
-                busy = query_in_progress
+            user = self.resolve_user(parsed)
+            if user is None:
+                return
+            with user.lock:
+                busy = user.query_in_progress
             if busy:
                 self.send_json_response(
-                    {"status": "already_running", **get_status()}, status=409
+                    {"status": "already_running", **get_status(user)}, status=409
                 )
                 return
 
-            # Rate limit: at most one manual trigger per REFRESH_MIN_INTERVAL.
-            global last_manual_refresh
+            # Rate limit: at most one manual trigger per REFRESH_MIN_INTERVAL per user.
             now = time.monotonic()
-            with _refresh_gate:
-                elapsed = now - last_manual_refresh
-                if last_manual_refresh and elapsed < REFRESH_MIN_INTERVAL:
+            with user.refresh_gate:
+                elapsed = now - user.last_manual_refresh
+                if user.last_manual_refresh and elapsed < REFRESH_MIN_INTERVAL:
                     retry_after = int(REFRESH_MIN_INTERVAL - elapsed) + 1
                 else:
                     retry_after = 0
-                    last_manual_refresh = now
+                    user.last_manual_refresh = now
 
             if retry_after:
                 self.send_json_response(
@@ -380,36 +541,38 @@ class UsageHandler(SimpleHTTPRequestHandler):
                         "status": "rate_limited",
                         "retry_after_seconds": retry_after,
                         "min_interval_seconds": REFRESH_MIN_INTERVAL,
-                        **get_status(),
+                        **get_status(user),
                     },
                     status=429,
                     extra_headers={"Retry-After": str(retry_after)},
                 )
                 return
 
-            threading.Thread(target=run_query, daemon=True).start()
-            self.send_json_response({"status": "refresh_triggered", **get_status()})
+            threading.Thread(target=run_query, args=(user,), daemon=True).start()
+            self.send_json_response({"status": "refresh_triggered", **get_status(user)})
         else:
             self.send_error(404, "Not Found")
 
-    def serve_history(self):
+    def serve_history(self, user):
         """Return usage history, never crashing on a corrupt file."""
-        if not HISTORY_FILE.exists():
-            self.send_json_response({"records": [], "error": "No data yet"})
+        if not user.history_file.exists():
+            self.send_json_response({"user": user.name, "records": [], "error": "No data yet"})
             return
         try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            with open(user.history_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except json.JSONDecodeError as e:
             self.send_json_response(
-                {"records": [], "error": f"历史文件已损坏: {e}"}, status=500
+                {"user": user.name, "records": [], "error": f"历史文件已损坏: {e}"}, status=500
             )
             return
         except OSError as e:
             self.send_json_response(
-                {"records": [], "error": f"历史文件读取失败: {e}"}, status=500
+                {"user": user.name, "records": [], "error": f"历史文件读取失败: {e}"}, status=500
             )
             return
+        if isinstance(data, dict):
+            data["user"] = user.name
         self.send_json_response(data)
 
     def serve_static(self, filename):
@@ -452,6 +615,7 @@ def main():
     """Main entry point"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     load_env()
+    configure_users()
 
     print("=" * 60)
     print("🤖 ZhipuAI Usage Monitor Server")
@@ -461,17 +625,22 @@ def main():
     print(f"App directory: {APP_DIR}")
     print(f"Data directory: {DATA_DIR}")
     print(f"Live quota TTL: {LIVE_QUOTA_TTL}s")
+    print(f"Users: {', '.join(f'{u.name} -> {u.history_file.name}' for u in USERS.values()) or '(none)'}")
+    for err in CONFIG_ERRORS:
+        print(f"⚠️  {err}")
     print("=" * 60, flush=True)
 
     # The first query used to run synchronously BEFORE bind(), blocking startup
     # for up to 60 seconds and making the healthcheck flap. Now it is a thread.
-    threading.Thread(target=run_query, daemon=True).start()
+    threading.Thread(target=run_all_users, daemon=True).start()
 
     scheduler_thread = threading.Thread(target=scheduler, daemon=True)
     scheduler_thread.start()
     log("Scheduler started")
 
-    server = HTTPServer(("0.0.0.0", PORT), UsageHandler)
+    # Threading: one slow upstream call (live quota, up to 15s) for one user
+    # must not stall every other request. All shared state is per-user locked.
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), UsageHandler)
     log(f"Server started at http://0.0.0.0:{PORT}")
 
     try:

@@ -533,6 +533,103 @@
             font-size: 0.9rem;
         }
 
+        /* --- multi-user: overview table + user switcher -------------------- */
+        .overview {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 16px 20px;
+            margin-bottom: 20px;
+        }
+
+        .overview h2 {
+            font-size: 1rem;
+            color: #fff;
+            margin-bottom: 12px;
+        }
+
+        .overview-scroll {
+            overflow-x: auto;
+        }
+
+        .overview table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+
+        .overview th,
+        .overview td {
+            padding: 10px 12px;
+            text-align: right;
+            white-space: nowrap;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+
+        .overview th:first-child,
+        .overview td:first-child {
+            text-align: left;
+        }
+
+        .overview th {
+            color: #888;
+            font-weight: 500;
+            font-size: 0.8rem;
+        }
+
+        .overview tbody tr {
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+
+        .overview tbody tr:hover { background: rgba(255, 255, 255, 0.04); }
+        .overview tbody tr.active { background: rgba(59, 130, 246, 0.15); }
+        .overview tbody tr:last-child td { border-bottom: none; }
+
+        .overview .pct.low { color: #22c55e; }
+        .overview .pct.medium { color: #f59e0b; }
+        .overview .pct.high { color: #ef4444; }
+        .overview .muted { color: #666; }
+        .overview .row-error { color: #f87171; font-size: 0.8rem; margin-left: 6px; }
+
+        .user-tabs {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .user-tab {
+            background: rgba(255, 255, 255, 0.05);
+            color: #e0e0e0;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            padding: 8px 18px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+        }
+
+        .user-tab:hover { border-color: rgba(59, 130, 246, 0.6); }
+
+        .user-tab.active {
+            background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+            border-color: transparent;
+            color: #fff;
+        }
+
+        .user-tab .tab-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+            background: #22c55e;
+        }
+
+        .user-tab .tab-dot.bad { background: #ef4444; }
+
         @media (max-width: 768px) {
             header h1 {
                 font-size: 1.8rem;
@@ -554,6 +651,51 @@
                 padding: 8px 12px;
                 font-size: 0.85rem;
             }
+
+            body {
+                padding: 12px;
+            }
+
+            .overview {
+                padding: 12px;
+            }
+
+            .overview th,
+            .overview td {
+                padding: 8px 6px;
+                font-size: 0.8rem;
+            }
+
+            .overview .hide-mobile,
+            .overview .row-error .err-text {
+                display: none;
+            }
+
+            /* 20 bars must fit ~300px: drop per-bar values, thin the labels */
+            .chart-wrap {
+                grid-template-columns: 40px minmax(0, 1fr) 40px;
+                gap: 4px;
+            }
+
+            .chart,
+            .chart-labels {
+                gap: 2px;
+            }
+
+            .chart-bar::after {
+                display: none;
+            }
+
+            .chart-labels span {
+                min-width: 0;
+                overflow: visible;
+                font-size: 0.6rem;
+                visibility: hidden;
+            }
+
+            .chart-labels span:nth-child(4n+1) {
+                visibility: visible;
+            }
         }
     </style>
 </head>
@@ -563,6 +705,27 @@
             <h1>🤖 ZhipuAI Coding Plan</h1>
             <p class="subtitle">实时使用量监控面板</p>
         </header>
+
+        <section class="overview" id="overview" style="display:none">
+            <h2>👥 用户总览</h2>
+            <div class="overview-scroll">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>用户</th>
+                            <th>5h 配额</th>
+                            <th>周配额</th>
+                            <th>24h Tokens</th>
+                            <th class="hide-mobile">等级</th>
+                            <th class="hide-mobile">最近采集</th>
+                        </tr>
+                    </thead>
+                    <tbody id="overview-body"></tbody>
+                </table>
+            </div>
+        </section>
+
+        <div class="user-tabs" id="user-tabs" style="display:none"></div>
 
         <div class="status-bar">
             <div class="status-item">
@@ -626,6 +789,30 @@
         let liveQuotaLoading = true;
         let contentRendered = false;
         let freshnessTimer = null;
+
+        // Multi-user state. currentUser is mirrored into the URL (?user=) so a
+        // reload or a shared link lands on the same user. viewGen is bumped on
+        // every switch; responses for an older view are dropped on arrival so
+        // a slow request for user A can never paint over user B.
+        let users = [];            // [{ name, is_default }]
+        let currentUser = null;
+        let viewGen = 0;
+        let overviewRows = [];
+        let lastStatus = null;     // last /api/status body for currentUser
+
+        // Build an API URL for the current user.
+        function apiUrl(path, extra) {
+            const params = new URLSearchParams(extra || {});
+            if (currentUser) params.set('user', currentUser);
+            const qs = params.toString();
+            return `${API_BASE}${path}${qs ? '?' + qs : ''}`;
+        }
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[c]));
+        }
 
         // Detect server API availability
         async function detectServerAPI() {
@@ -740,14 +927,18 @@
             if (!hasServerAPI) return;
 
             try {
-                const response = await fetch(`${API_BASE}/api/status`);
+                const gen = viewGen;
+                const response = await fetch(apiUrl('/api/status'));
+                if (gen !== viewGen) return;
                 if (response.ok) {
                     const status = await response.json();
+                    if (gen !== viewGen) return;
                     lastUpdateTime = status.last_update ? new Date(status.last_update) : null;
                     nextUpdateTime = status.next_update ? new Date(status.next_update) : null;
                     refreshIntervalMinutes = status.refresh_interval_minutes || 15;
                     document.getElementById('refresh-interval').textContent = refreshIntervalMinutes;
                     document.getElementById('last-update').textContent = formatTime(status.last_update);
+                    lastStatus = status;
                     if (status.last_error) {
                         const dot = document.getElementById('status-dot');
                         const text = document.getElementById('status-text');
@@ -770,11 +961,13 @@
         //         data:null, error:"..." }
         // ------------------------------------------------------------------
         async function refreshLiveQuota() {
+            const gen = viewGen;
             liveQuotaLoading = true;
             renderFreshness();
             try {
-                const response = await fetch(`${API_BASE}/api/quota/live?t=${Date.now()}`);
+                const response = await fetch(apiUrl('/api/quota/live', { t: Date.now() }));
                 const payload = await response.json();
+                if (gen !== viewGen) return;
                 if (payload && payload.ok && payload.data) {
                     liveQuota = payload;
                     liveQuotaError = null;
@@ -783,11 +976,11 @@
                     liveQuotaError = (payload && payload.error) || `HTTP ${response.status}`;
                 }
             } catch (e) {
+                if (gen !== viewGen) return;
                 liveQuotaError = e.message || String(e);
-            } finally {
-                liveQuotaLoading = false;
-                applyLiveQuota();
             }
+            liveQuotaLoading = false;
+            applyLiveQuota();
         }
 
         // Swap the balance numbers in place once the live payload lands.
@@ -854,7 +1047,7 @@
             try {
                 if (hasServerAPI) {
                     // Trigger server refresh
-                    const response = await fetch(`${API_BASE}/api/refresh`, { method: 'POST' });
+                    const response = await fetch(apiUrl('/api/refresh'), { method: 'POST' });
                     if (response.ok) {
                         const status = await response.json();
                         lastUpdateTime = status.last_update ? new Date(status.last_update) : null;
@@ -876,7 +1069,7 @@
                 await new Promise(resolve => setTimeout(resolve, 2000));
 
                 // Reload data + live balance
-                await Promise.all([loadData(), refreshLiveQuota()]);
+                await Promise.all([loadData(), refreshLiveQuota(), loadOverview()]);
             } catch (e) {
                 console.error('Refresh failed:', e);
             } finally {
@@ -897,8 +1090,15 @@
             // `ok` is the new per-query flag; `success`/`code` are the legacy
             // envelope fields still present in the 100 pre-existing records.
             const isSuccess = quotaLimits?.ok ?? (quotaLimits?.success || quotaLimits?.code === 200);
-            document.getElementById('status-dot').className = 'dot ' + (isSuccess ? 'online' : 'offline');
-            document.getElementById('status-text').textContent = isSuccess ? 'API 正常' : 'API 异常';
+            // A failing collector (from /api/status) outranks an old good record.
+            if (lastStatus && lastStatus.last_error) {
+                document.getElementById('status-dot').className = 'dot offline';
+                document.getElementById('status-text').textContent =
+                    '采集异常 (' + (lastStatus.consecutive_failures || 0) + ' 次连续失败)';
+            } else {
+                document.getElementById('status-dot').className = 'dot ' + (isSuccess ? 'online' : 'offline');
+                document.getElementById('status-text').textContent = isSuccess ? 'API 正常' : 'API 异常';
+            }
             
             if (!lastUpdateTime) {
                 document.getElementById('last-update').textContent = formatTime(latest.query_time);
@@ -1206,7 +1406,7 @@
             document.getElementById('content').innerHTML = `
                 <div class="error-message">
                     <h2>❌ 加载失败</h2>
-                    <p>${message}</p>
+                    <p>${escapeHtml(message)}</p>
                     <button class="btn" onclick="forceRefresh()">重新加载</button>
                 </div>
             `;
@@ -1215,8 +1415,20 @@
         // Load data. Tries the server API first and falls back to the static
         // JSON file, so it no longer has to wait for detectServerAPI().
         async function loadData() {
+            const gen = viewGen;
             try {
-                let response = await fetch(`${API_BASE}/api/history?t=${Date.now()}`).catch(() => null);
+                let response = await fetch(apiUrl('/api/history', { t: Date.now() })).catch(() => null);
+                // The static-file fallback only exists for the single legacy
+                // file, i.e. the first (default) user.
+                const isDefaultUser = !currentUser || (users[0] && users[0].name === currentUser);
+                if ((!response || !response.ok) && !isDefaultUser) {
+                    let detail = '';
+                    try {
+                        const body = response ? await response.json() : null;
+                        if (body && body.error) detail = `：${body.error}`;
+                    } catch (e) { /* not JSON */ }
+                    throw new Error('无法加载该用户的历史数据' + detail);
+                }
                 if (!response || !response.ok) {
                     let detail = '';
                     if (response) {
@@ -1230,20 +1442,173 @@
                 }
 
                 const data = await response.json();
+                if (gen !== viewGen) return;
                 if (!data.records || data.records.length === 0) {
-                    throw new Error('没有可用的历史记录');
+                    throw new Error('没有可用的历史记录' + (data.error ? `：${data.error}` : ''));
                 }
 
                 renderContent(data);
             } catch (error) {
+                if (gen !== viewGen) return;
                 renderError(error.message);
             }
         }
+
+        // ------------------------------------------------------------------
+        // Multi-user: user list, overview table, switching
+        // ------------------------------------------------------------------
+        async function loadUsers() {
+            try {
+                const response = await fetch(`${API_BASE}/api/users`);
+                if (!response.ok) return;
+                const body = await response.json();
+                users = Array.isArray(body.users) ? body.users : [];
+                (body.config_errors || []).forEach(e => console.warn('Config:', e));
+            } catch (e) {
+                users = [];
+            }
+            const names = users.map(u => u.name);
+            const requested = new URLSearchParams(location.search).get('user');
+            if (requested && names.includes(requested)) {
+                currentUser = requested;
+            } else {
+                currentUser = names[0] || null;
+                if (requested) syncUrl(true);   // unknown ?user= -> drop it
+            }
+            renderUserTabs();
+        }
+
+        function syncUrl(replace) {
+            const url = new URL(location.href);
+            const isDefault = !currentUser || (users[0] && users[0].name === currentUser);
+            if (isDefault) url.searchParams.delete('user');
+            else url.searchParams.set('user', currentUser);
+            if (url.href === location.href) return;
+            if (replace) history.replaceState(null, '', url);
+            else history.pushState(null, '', url);
+        }
+
+        function rowFor(name) {
+            return overviewRows.find(r => r.user === name);
+        }
+
+        function renderUserTabs() {
+            const el = document.getElementById('user-tabs');
+            if (users.length < 2) {
+                el.style.display = 'none';
+                return;
+            }
+            el.style.display = 'flex';
+            el.innerHTML = users.map(u => {
+                const row = rowFor(u.name);
+                const bad = row && (row.healthy === false || row.history_error);
+                return `<button class="user-tab ${u.name === currentUser ? 'active' : ''}"
+                            data-user="${escapeHtml(u.name)}">
+                            <span class="tab-dot ${bad ? 'bad' : ''}"></span>${escapeHtml(u.name)}
+                        </button>`;
+            }).join('');
+            el.querySelectorAll('.user-tab').forEach(btn => {
+                btn.addEventListener('click', () => selectUser(btn.dataset.user));
+            });
+        }
+
+        function pctCell(value) {
+            if (value === null || value === undefined || !isFinite(Number(value))) {
+                return '<td class="muted">--</td>';
+            }
+            return `<td class="pct ${getProgressClass(Number(value))}">${escapeHtml(value)}%</td>`;
+        }
+
+        function renderOverview() {
+            const section = document.getElementById('overview');
+            if (users.length < 2) {
+                section.style.display = 'none';
+                return;
+            }
+            section.style.display = 'block';
+            const body = document.getElementById('overview-body');
+            body.innerHTML = overviewRows.map(r => {
+                const err = r.history_error || (r.healthy === false ? '采集异常' : '');
+                return `
+                    <tr data-user="${escapeHtml(r.user)}" class="${r.user === currentUser ? 'active' : ''}"
+                        title="${escapeHtml(r.last_error || r.history_error || '')}">
+                        <td><strong>${escapeHtml(r.user)}</strong>${err ? `<span class="row-error">⚠️<span class="err-text"> ${escapeHtml(err)}</span></span>` : ''}</td>
+                        ${pctCell(r.five_hour_pct)}
+                        ${pctCell(r.weekly_pct)}
+                        <td>${formatNumber(r.tokens_24h)}</td>
+                        <td class="hide-mobile">${r.level ? escapeHtml(String(r.level).toUpperCase()) : '--'}</td>
+                        <td class="hide-mobile muted">${formatTime(r.record_time)}</td>
+                    </tr>`;
+            }).join('');
+            body.querySelectorAll('tr[data-user]').forEach(tr => {
+                tr.addEventListener('click', () => selectUser(tr.dataset.user));
+            });
+        }
+
+        async function loadOverview() {
+            if (users.length < 2) {
+                renderOverview();
+                return;
+            }
+            try {
+                const response = await fetch(`${API_BASE}/api/overview?t=${Date.now()}`);
+                if (!response.ok) return;
+                const body = await response.json();
+                overviewRows = Array.isArray(body.users) ? body.users : [];
+            } catch (e) {
+                console.warn('Overview not available');
+            }
+            renderOverview();
+            renderUserTabs();
+        }
+
+        // Reset every per-user piece of page state, then reload for the new user.
+        function resetUserView() {
+            viewGen += 1;
+            liveQuota = null;
+            liveQuotaError = null;
+            liveQuotaFetchedAt = null;
+            liveQuotaLoading = true;
+            contentRendered = false;
+            lastUpdateTime = null;
+            nextUpdateTime = null;
+            lastStatus = null;
+            document.getElementById('last-update').textContent = '--';
+            document.getElementById('countdown').textContent = '--';
+            document.getElementById('account-level').textContent = '--';
+            document.getElementById('status-dot').className = 'dot';
+            document.getElementById('status-text').textContent = '加载中...';
+            document.getElementById('content').innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <p>正在加载 ${escapeHtml(currentUser || '')} 的数据...</p>
+                </div>`;
+        }
+
+        async function selectUser(name, fromHistory) {
+            if (!users.some(u => u.name === name) || name === currentUser) return;
+            currentUser = name;
+            if (!fromHistory) syncUrl(false);
+            resetUserView();
+            renderUserTabs();
+            renderOverview();
+            await Promise.allSettled([loadData(), refreshLiveQuota(), updateServerStatus()]);
+        }
+
+        window.addEventListener('popstate', () => {
+            const requested = new URLSearchParams(location.search).get('user');
+            const target = requested && users.some(u => u.name === requested)
+                ? requested : (users[0] && users[0].name);
+            if (target) selectUser(target, true);
+        });
 
         // Initialize.
         // History paints the page immediately (0 latency) while the live
         // balance request runs concurrently and replaces the numbers on arrival.
         async function init() {
+            // The user list decides which ?user= every other call carries.
+            await loadUsers();
+            const overviewPromise = loadOverview();
             const historyPromise = loadData();
             const livePromise = refreshLiveQuota();
 
@@ -1252,7 +1617,7 @@
                 return updateServerStatus();
             });
 
-            await Promise.allSettled([historyPromise, livePromise]);
+            await Promise.allSettled([historyPromise, livePromise, overviewPromise]);
 
             // Start countdown timer
             countdownTimer = setInterval(updateCountdown, 1000);
@@ -1262,6 +1627,9 @@
 
             // Live balance stays fresh on its own cadence (server caches 60s)
             setInterval(refreshLiveQuota, 60000);
+
+            // Overview table: local server state only, no upstream calls
+            setInterval(loadOverview, 60000);
 
             // Auto refresh history / trend data
             setInterval(async () => {

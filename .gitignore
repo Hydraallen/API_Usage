@@ -10,8 +10,9 @@
 # Private deployment overrides (host paths, resource limits, secrets)
 docker-compose.override.yml
 
-# Usage history (contains API key previews)
+# Usage history (one file per user; first user keeps usage_history.json)
 usage_history.json
+usage_history.*.json
 
 # ===========================================
 # Python

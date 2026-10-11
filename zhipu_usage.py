@@ -13,9 +13,14 @@ Updated: 2026-09-03 - Zero third-party dependencies (stdlib urllib only),
                       envelope-shape success detection, uniform {ok,payload,error}
                       contract, atomic history writes, non-zero exit on failure,
                       removed the quota-consuming chat/completions probe.
+Updated: 2026-10-10 - Multi-user: ZHIPUAI_API_KEYS=Name:key,..., one history
+                      file per user (first user keeps usage_history.json),
+                      `--user NAME` selects one user.
 """
 
+import argparse
 import os
+import re
 import sys
 import json
 import socket
@@ -23,8 +28,9 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -69,15 +75,117 @@ def load_env():
 
 load_env()
 
-# Configuration
-API_KEY = os.environ.get("ZHIPUAI_API_KEY", "")
-if not API_KEY:
-    print("❌ 错误: 未找到 ZHIPUAI_API_KEY")
-    print("   请创建 .env 文件并设置 ZHIPUAI_API_KEY=your_api_key")
-    print("   或设置环境变量: export ZHIPUAI_API_KEY=your_api_key")
-    sys.exit(1)
-
 BASE_URL = "https://open.bigmodel.cn"  # CN platform
+
+# The key of the user currently being queried. Set by main() before any
+# request goes out; it is deliberately NOT resolved at import time any more,
+# so server.py can import this module (for parse_envelope / load_users) even
+# when nothing is configured.
+API_KEY = ""
+
+
+# ---------------------------------------------------------------------------
+# Multi-user configuration
+#
+#   ZHIPUAI_API_KEYS=Alice:<key>,Bob:<key>   (preferred, multi-user)
+#   ZHIPUAI_API_KEY=<key>                    (legacy, single user)
+#   ZHIPUAI_DEFAULT_USER=<name>              (name for the legacy single key)
+#
+# Keys contain "." but never ":", so each entry is split on its FIRST ":".
+# When ZHIPUAI_API_KEYS is set it is authoritative and the legacy variable is
+# ignored. User names are whitelisted and are the ONLY identifier anything is
+# derived from (file names, URLs, logs) — nothing is ever derived from a key.
+# ---------------------------------------------------------------------------
+USER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+LEGACY_HISTORY_NAME = "usage_history.json"
+FALLBACK_DEFAULT_USER = "default"
+
+
+@dataclass(frozen=True)
+class UserConfig:
+    name: str
+    key: str
+    history_name: str  # file name inside DATA_DIR
+
+
+@dataclass(frozen=True)
+class UsersConfig:
+    users: Tuple[UserConfig, ...]
+    errors: Tuple[str, ...]   # human-readable; never contain key material
+    secrets: Tuple[str, ...]  # every key-like string seen, for redaction
+
+
+def history_name_for(index: int, name: str) -> str:
+    """The first user keeps the original file, so upgrading needs no migration."""
+    return LEGACY_HISTORY_NAME if index == 0 else f"usage_history.{name}.json"
+
+
+def load_users(environ: Optional[Dict[str, str]] = None) -> UsersConfig:
+    """Parse the user list out of the environment. Never raises, never exits."""
+    env = os.environ if environ is None else environ
+    errors: List[str] = []
+    secrets: List[str] = []
+    pairs: List[Tuple[str, str]] = []
+
+    multi = env.get("ZHIPUAI_API_KEYS", "").strip()
+    legacy = env.get("ZHIPUAI_API_KEY", "").strip()
+    if legacy:
+        secrets.append(legacy)
+
+    if multi:
+        seen = set()
+        for idx, entry in enumerate(multi.split(","), start=1):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if ":" not in entry:
+                # The whole entry may well be a bare key: do not echo it.
+                secrets.append(entry)
+                errors.append(f"ZHIPUAI_API_KEYS 第 {idx} 项缺少 ':' 分隔符，已忽略")
+                continue
+            name, key = (part.strip() for part in entry.split(":", 1))
+            if key:
+                secrets.append(key)
+            if not USER_NAME_RE.match(name):
+                errors.append(
+                    f"ZHIPUAI_API_KEYS 第 {idx} 项用户名不合法"
+                    "（只允许 A-Z a-z 0-9 _ -，1-32 位），已忽略"
+                )
+                continue
+            if not key:
+                errors.append(f"ZHIPUAI_API_KEYS 第 {idx} 项（{name}）key 为空，已忽略")
+                continue
+            if name in seen:
+                errors.append(f"ZHIPUAI_API_KEYS 第 {idx} 项用户名 {name} 重复，已忽略")
+                continue
+            seen.add(name)
+            pairs.append((name, key))
+        if legacy and pairs and legacy not in {k for _, k in pairs}:
+            errors.append("ZHIPUAI_API_KEYS 已设置，ZHIPUAI_API_KEY 被忽略（且不在用户列表中）")
+    elif legacy:
+        name = env.get("ZHIPUAI_DEFAULT_USER", "").strip() or FALLBACK_DEFAULT_USER
+        if not USER_NAME_RE.match(name):
+            errors.append(
+                f"ZHIPUAI_DEFAULT_USER 不合法，改用 {FALLBACK_DEFAULT_USER}"
+            )
+            name = FALLBACK_DEFAULT_USER
+        pairs.append((name, legacy))
+
+    users = tuple(
+        UserConfig(name=n, key=k, history_name=history_name_for(i, n))
+        for i, (n, k) in enumerate(pairs)
+    )
+    return UsersConfig(users=users, errors=tuple(errors), secrets=tuple(secrets))
+
+
+def redact(text: Optional[str], secrets) -> Optional[str]:
+    """Replace every known key in `text` with [REDACTED]."""
+    if not text:
+        return text
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret and len(secret) >= 8:
+            text = text.replace(secret, "[REDACTED]")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -258,13 +366,15 @@ def make_request(endpoint: str, method: str = "GET", params: Optional[Dict] = No
     }
 
     status, payload, error = _http_request(method, url, headers, body=body)
+    # Error strings end up in the public history file, so an upstream body
+    # that echoes the key back must not get through.
     if error is not None:
-        return err_result(f"{endpoint} -> {error}")
+        return err_result(redact(f"{endpoint} -> {error}", (API_KEY,)))
 
     ok, data, envelope_error = parse_envelope(status, payload)
     if ok:
         return ok_result(data)
-    return err_result(f"{endpoint} -> {envelope_error}")
+    return err_result(redact(f"{endpoint} -> {envelope_error}", (API_KEY,)))
 
 
 def get_time_window() -> tuple:
@@ -470,7 +580,7 @@ def query_available_models() -> Dict[str, Any]:
     return {"ok": True, "payload": models, "error": None}
 
 
-def save_results(all_results: Dict[str, Any]) -> Path:
+def save_results(all_results: Dict[str, Any], history_name: str = LEGACY_HISTORY_NAME) -> Path:
     """Append one record to the history file, written ATOMICALLY.
 
     The previous implementation truncated usage_history.json with open(...,"w")
@@ -480,7 +590,7 @@ def save_results(all_results: Dict[str, Any]) -> Path:
     atomic on the same filesystem.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    filepath = DATA_DIR / "usage_history.json"
+    filepath = DATA_DIR / history_name
 
     history = {"records": []}
     if filepath.exists():
@@ -532,14 +642,17 @@ def to_record(result: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": result["ok"], "error": result["error"], "data": result["payload"]}
 
 
-def main() -> int:
-    """Main function. Returns a process exit code."""
+def run_for_user(user: UserConfig) -> int:
+    """Query one user and append to that user's history. Returns an exit code."""
+    global API_KEY
+    API_KEY = user.key
     print("╔" + "═" * 68 + "╗")
     print("║" + " " * 68 + "║")
     print("║" + "   🤖 ZhipuAI Coding Plan 使用量查询工具".center(60) + "   ║")
     print("║" + " " * 68 + "║")
     print("╚" + "═" * 68 + "╝")
-    print(f"\n📅 查询时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\n👤 用户: {user.name}")
+    print(f"📅 查询时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     # Never print any fragment of the key. The dashboard and its /api/*
     # endpoints are designed to be publicly reachable, and stdout ends up in
     # `docker logs`; "configured / not configured" is all an operator needs.
@@ -587,7 +700,7 @@ def main() -> int:
         print("=" * 70)
         return 1
 
-    save_results(all_results)
+    save_results(all_results, user.history_name)
 
     print("\n" + "=" * 70)
     print("✨ 查询完成!" if ok_count == total_queries else "⚠️  查询部分完成 (partial)")
@@ -596,6 +709,43 @@ def main() -> int:
     # 0 = all good, 2 = partial (record written, some endpoints failed),
     # 1 = total failure (nothing written).
     return 0 if ok_count == total_queries else 2
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Entry point. Returns a process exit code.
+
+    `--user NAME` queries one user (this is how server.py calls it — the key
+    itself travels through the environment, never through argv). Without it
+    every configured user is queried in turn.
+    """
+    parser = argparse.ArgumentParser(description="ZhipuAI Coding Plan usage query")
+    parser.add_argument("--user", help="只查询这个用户（默认查询全部用户）")
+    args = parser.parse_args(argv)
+
+    config = load_users()
+    for err in config.errors:
+        print(f"⚠️  {err}", file=sys.stderr)
+    if not config.users:
+        print("❌ 错误: 未配置任何 API Key", file=sys.stderr)
+        print("   请在 .env 中设置 ZHIPUAI_API_KEYS=Name1:key1,Name2:key2", file=sys.stderr)
+        print("   或旧格式 ZHIPUAI_API_KEY=your_api_key", file=sys.stderr)
+        return 1
+
+    targets = list(config.users)
+    if args.user is not None:
+        targets = [u for u in config.users if u.name == args.user]
+        if not targets:
+            print("❌ 错误: 未知用户（--user 不在配置的用户列表中）", file=sys.stderr)
+            return 1
+
+    codes = [run_for_user(u) for u in targets]
+    if len(codes) == 1:
+        return codes[0]
+    if all(c == 0 for c in codes):
+        return 0
+    if all(c == 1 for c in codes):
+        return 1
+    return 2
 
 
 if __name__ == "__main__":

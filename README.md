@@ -47,6 +47,7 @@ clone 下来就能构建，构建期不需要访问 pypi。支持本地直接运
 | 🚀 **强制更新** | 一键手动触发数据刷新 |
 | 🐳 **Docker支持** | `docker compose up -d --build` 一键部署 |
 | 📦 **零依赖** | 不装任何 pip 包（`urllib` + `json` + `http.server`），构建期完全离线 |
+| 👥 **多用户** | 一个面板监控多个智谱账户：顶部总览表对比各用户配额，点选后看该用户完整详情；`?user=` 可直接分享 |
 
 ---
 
@@ -87,6 +88,13 @@ services:
   api-usage-monitor:
     env_file:
       - ./secrets.env      # 内容：ZHIPUAI_API_KEY=<your_api_key>
+```
+
+**多用户**：把 `ZHIPUAI_API_KEY` 换成 `ZHIPUAI_API_KEYS`，格式见下文
+[多用户配置](#多用户配置)：
+
+```yaml
+      - ZHIPUAI_API_KEYS=Alice:<key_of_alice>,Bob:<key_of_bob>
 ```
 
 **方式 B：放进数据卷的 `.env`（`load_env()` 的回退路径）**
@@ -180,8 +188,11 @@ $EDITOR .env        # 填入 API Key
 #### 3️⃣ 运行查询
 
 ```bash
-# 单次查询
+# 单次查询（多用户时依次查询全部用户）
 python3 zhipu_usage.py
+
+# 只查询一个用户
+python3 zhipu_usage.py --user Alice
 
 # 或使用环境变量
 export ZHIPUAI_API_KEY="<your_api_key>"
@@ -189,6 +200,7 @@ python3 zhipu_usage.py
 ```
 
 退出码：`0` = 全部成功，`2` = 部分成功（已写历史），`1` = 全部失败（不写历史）。
+查询多个用户时：全部为 0 才返回 `0`，全部失败返回 `1`，其余返回 `2`。
 
 #### 4️⃣ 查看结果
 
@@ -212,7 +224,8 @@ API_Usage/
 ├── 📄 .env                 # 本地运行用；Docker 模式请放到数据卷 ${DATA_DIR}/.env
 ├── 📄 .gitignore           # Git 忽略规则
 ├── 📄 README.md            # 本文档
-└── 📄 usage_history.json   # 历史记录（自动生成，写在 DATA_DIR 下，原子替换）
+├── 📄 usage_history.json   # 第一个用户的历史记录（自动生成，写在 DATA_DIR 下，原子替换）
+└── 📄 usage_history.<用户名>.json  # 其余用户各自的历史记录
 ```
 
 ---
@@ -223,7 +236,9 @@ API_Usage/
 
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
-| `ZHIPUAI_API_KEY` | ✅ | - | 智谱AI API Key。可用环境变量 / `env_file` 注入，或写进 `${DATA_DIR}/.env` |
+| `ZHIPUAI_API_KEYS` | ✅¹ | - | 多用户：`Name1:key1,Name2:key2`。设置后 `ZHIPUAI_API_KEY` 被忽略 |
+| `ZHIPUAI_API_KEY` | ✅¹ | - | 旧格式单用户 Key。可用环境变量 / `env_file` 注入，或写进 `${DATA_DIR}/.env` |
+| `ZHIPUAI_DEFAULT_USER` | ❌ | `default` | 只配置 `ZHIPUAI_API_KEY` 时，这个唯一用户的用户名 |
 | `DATA_DIR` | ❌ | Docker 下 `/app/data`（宿主侧默认 `./data`），本地为脚本所在目录 | `.env` 与 `usage_history.json` 的存放目录，`server.py` 和 `zhipu_usage.py` 共用 |
 | `HOST_PORT` | ❌ | `8080` | **宿主机**发布端口，只影响 compose 的 `ports` 左半边 |
 | `PORT` | ❌ | `8080` | **容器内**监听端口。一般不要动，改 `HOST_PORT` 就够了 |
@@ -231,8 +246,41 @@ API_Usage/
 | `REFRESH_INTERVAL` | ❌ | `15` | 后台采集间隔（分钟），只喂趋势图；页面余额走 `/api/quota/live` |
 | `LIVE_QUOTA_TTL` | ❌ | `60` | `/api/quota/live` 的内存缓存 TTL（秒） |
 
+¹ 两者至少配置一个。
+
 > ⚠️ `PORT` 是容器内端口，`HOST_PORT` 是宿主端口。只改 `HOST_PORT` 即可换访问端口；
 > 把 `PORT` 改掉而不同步改映射右半边，页面会直接连不上。
+
+### 多用户配置
+
+```
+ZHIPUAI_API_KEYS=Alice:<key_of_alice>,Bob:<key_of_bob>
+```
+
+- 每项按**第一个** `:` 切分为「用户名:Key」（Key 本身含 `.`、不含 `:`）；项之间用 `,` 分隔，两侧空白会被去掉
+- 用户名只允许 `A-Z a-z 0-9 _ -`，1–32 位。不合法、缺 `:`、Key 为空、用户名重复的项会被**忽略**，
+  原因打印在启动日志里，并通过 `GET /api/users` 的 `config_errors` 返回（原因里不含 Key）
+- 文件名、URL、日志只使用用户名，**不从 Key 派生任何标识**
+- 设置了 `ZHIPUAI_API_KEYS` 时，它是唯一依据，`ZHIPUAI_API_KEY` 被忽略
+- 只设置 `ZHIPUAI_API_KEY`（旧格式）时视为单用户，用户名取 `ZHIPUAI_DEFAULT_USER`（默认 `default`）
+
+**历史文件布局（升级零迁移）**
+
+| 用户 | 历史文件 |
+|------|----------|
+| 第一个用户（`ZHIPUAI_API_KEYS` 的第一项，或旧格式的唯一用户） | `usage_history.json`（与旧版本同一个文件） |
+| 其余用户 | `usage_history.<用户名>.json` |
+
+从单用户升级到多用户时，**把原来的账户放在 `ZHIPUAI_API_KEYS` 的第一项**，它会继续写原来的
+`usage_history.json`，已有历史全部保留，不需要任何手工迁移。调整用户顺序会改变第一个用户与
+`usage_history.json` 的对应关系。
+
+**采集方式**：后台按配置顺序**逐个用户串行**采集；每个用户的状态、实时余额缓存、刷新节流、
+「正在采集」锁相互独立，一个用户的 Key 失效只影响该用户，页面上其他用户照常显示。
+
+**面板**：配置了 2 个及以上用户时，页面顶部显示总览表（用户 / 5h 配额 / 周配额 / 24h Tokens /
+等级 / 最近采集）和用户切换按钮；选中的用户写进 URL `?user=`，刷新页面或分享链接都会停在该用户。
+「强制更新」、倒计时、实时余额都只针对当前用户。只有 1 个用户时总览表和切换按钮自动隐藏，页面与旧版一致。
 
 ### 修改刷新间隔 / 端口 / 数据目录
 
@@ -283,16 +331,22 @@ docker exec -it api_usage_monitor /bin/bash
 
 ## 🌐 API 接口
 
-Docker 模式下提供以下 API：
+Docker 模式下提供以下 API。标 `?user=` 的接口按用户区分：**不带参数时使用第一个用户**，
+因此旧客户端无需修改。
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/` | GET | 仪表盘（等价于 `/dashboard.html`） |
 | `/dashboard.html` | GET | 可视化监控面板 |
-| `/api/status` | GET | 服务状态：`last_update` / `last_success_time` / `last_error` / `consecutive_failures` / `healthy` |
-| `/api/quota/live` | GET | **按需实时余额**，只打上游一个只读接口，60 秒内存缓存 |
-| `/api/history` | GET | 历史数据（趋势图数据源）；文件损坏时返回 500 + `error` 字段 |
-| `/api/refresh` | POST | 触发强制采集（**仅 POST**；正在跑时返回 409） |
+| `/api/users` | GET | 用户名列表 `{users:[{name,is_default}], default, config_errors}` |
+| `/api/overview` | GET | 每用户一行：`level` / `five_hour_pct` / `weekly_pct` / `tokens_24h` / `calls_24h` / `record_time` / `healthy` / `last_error` 等。只读本地历史与已有的实时余额缓存，**不触发上游请求** |
+| `/api/status?user=` | GET | 该用户的采集状态：`last_update` / `last_success_time` / `last_error` / `consecutive_failures` / `healthy`。不带参数且未配置任何 Key 时仍返回 200（健康检查用） |
+| `/api/quota/live?user=` | GET | **按需实时余额**，只打上游一个只读接口，每用户 60 秒内存缓存 |
+| `/api/history?user=` | GET | 该用户的历史数据（趋势图数据源）；文件损坏时返回 500 + `error` 字段 |
+| `/api/refresh?user=` | POST | 触发该用户的强制采集（**仅 POST**；该用户正在跑时返回 409，过快返回 429） |
+
+`user` 参数错误时：格式不合法返回 `400`，用户不存在返回 `404`（响应带 `users` 列表），
+未配置任何 Key 返回 `503`。
 
 > 🔒 其余路径一律 404 —— 静态文件走白名单，`/server.py`、`/zhipu_usage.py`
 > 不再能被下载。
@@ -319,6 +373,12 @@ curl http://localhost:8080/api/quota/live
 
 # 触发刷新（POST，GET 会 404）
 curl -X POST http://localhost:8080/api/refresh
+
+# 多用户
+curl http://localhost:8080/api/users
+curl http://localhost:8080/api/overview
+curl "http://localhost:8080/api/history?user=Bob"
+curl -X POST "http://localhost:8080/api/refresh?user=Bob"
 ```
 
 ---
@@ -350,14 +410,16 @@ curl -X POST http://localhost:8080/api/refresh
 - 服务只服务白名单静态文件，源码不可通过 HTTP 下载
 - 接口不再下发 `Access-Control-Allow-Origin: *`，仅同源可读
 - 启动横幅只打印「已配置 / 未配置」与 Key 长度，**不输出 Key 的任何字符片段**
-- `/api/status` 的 `last_error` 在下发前会做一次兜底脱敏，把 Key 原文替换为 `[REDACTED]`
+- `/api/status` 的 `last_error`、`/api/quota/live` 的 `error`、写进历史文件的错误信息都会做兜底脱敏，
+  把**所有已配置用户**的 Key 原文替换为 `[REDACTED]`
+- 服务端调用采集器时 Key 经环境变量传递，命令行只有 `--user <用户名>`，`ps` 里看不到 Key
 
 ### 关于公网暴露
 
 **本项目的所有 HTTP 端点（页面与 `/api/*`）都是按「可公开访问」设计的**：
 
 - 响应体里不含任何凭证、凭证片段、内网地址或宿主机路径
-- `POST /api/refresh` 自带节流：默认 60 秒最多触发一次，超出返回 `429`
+- `POST /api/refresh` 自带节流：每个用户默认 60 秒最多触发一次，超出返回 `429`
   （带 `Retry-After`），与「正在跑」的 `409` 语义区分；节流窗口可用
   `REFRESH_MIN_INTERVAL` 环境变量调整
 - 静态文件走白名单，`/server.py` 之类一律 404
@@ -431,6 +493,12 @@ docker compose restart
 ---
 
 ## 📝 更新日志
+
+> 从 v1.4.0 起，版本级变更记录在 [CHANGELOG.md](CHANGELOG.md)。
+
+### v1.4.0 (2026-10-10)
+
+- 👥 多用户：`ZHIPUAI_API_KEYS=Name:key,...`，总览表 + 用户切换，详见 [CHANGELOG.md](CHANGELOG.md)
 
 ### v1.3.0 (2026-09-03)
 

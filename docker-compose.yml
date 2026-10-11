@@ -9,7 +9,7 @@
 # merges automatically. That keeps `git pull` conflict-free.
 #
 # Variables (put them in a `.env` beside this file, or export them):
-#   DATA_DIR   host directory for .env + usage_history.json   (default ./data)
+#   DATA_DIR   host directory for .env + usage_history*.json  (default ./data)
 #   HOST_PORT  port published on the host                     (default 8080)
 #   TZ         container timezone                             (default UTC)
 services:
