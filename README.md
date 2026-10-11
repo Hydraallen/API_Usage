@@ -402,12 +402,17 @@ curl -X POST "http://localhost:8080/api/refresh?user=Bob"
 
 | `type` | 观察到的账户 | 字段 |
 |--------|--------------|------|
-| `TOKENS_LIMIT` | MAX | `unit` / `number` / `percentage` / `nextResetTime` |
-| `CREDIT_LIMIT` | PRO | 另有 `usage`（额度上限）、`currentValue`（已用）、`remaining`（剩余） |
+| `TOKENS_LIMIT` | 旧账户（按 Token 计） | `unit` / `number` / `percentage` / `nextResetTime` |
+| `CREDIT_LIMIT` | 新账户（积分制） | 另有 `usage`（积分上限）、`currentValue`（已用积分）、`remaining`（剩余积分） |
+
+`CREDIT_LIMIT` 是新版 Coding Plan 的**积分额度**，积分不等于 Token（不同 Token 类型折算系数不同，
+工具调用也扣积分）。官方公布的上限为 Lite 2000 / 10000、Pro 12000 / 60000、Max 28000 / 140000
+（5 小时 / 每周），Pro 账户实测返回的 `usage` 与之一致。面板把它显示为「5小时积分额度」「每周积分额度」
+并标注「已用 x / 12,000 积分」，不当作 Token 显示；`TOKENS_LIMIT` 仍显示为「5小时滚动窗口」「周度限额」。
 
 窗口判定：`unit=3, number=5` 为 5 小时窗口，`unit=6, number=1` 为周窗口（两种类型相同）；
 编码未知时按距 `nextResetTime` 的剩余时间判定（≤ 5 小时为 5 小时窗口，≤ 7 天为周窗口）。
-百分比直接使用上游的 `percentage`（整数）；`CREDIT_LIMIT` 另显示「已用 / 上限」。
+百分比直接使用上游的 `percentage`（整数）；总览表的 5h / 周两列对两种类型都只显示百分比。
 
 ### 时间显示
 

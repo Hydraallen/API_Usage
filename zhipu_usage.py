@@ -184,9 +184,11 @@ def load_users(environ: Optional[Dict[str, str]] = None) -> UsersConfig:
 # Quota windows
 #
 # Accounts report their rolling quotas with one of two limit types:
-#   TOKENS_LIMIT  (e.g. MAX accounts)  — percentage only
-#   CREDIT_LIMIT  (e.g. PRO accounts)  — usage = cap, currentValue = used,
-#                                        remaining, percentage
+#   TOKENS_LIMIT  (older accounts)  — token based, percentage only
+#   CREDIT_LIMIT  (newer accounts)  — point based (积分, not tokens):
+#                                     usage = point cap, currentValue = used,
+#                                     remaining, percentage
+#                                     (Pro observed: 12000 per 5h / 60000 per week)
 # Both use the same window codes: unit=3,number=5 -> 5 hours,
 # unit=6,number=1 -> 1 week. When the codes are unknown, the time left until
 # nextResetTime decides (<= 5h -> 5-hour window, <= 7d -> weekly).
@@ -505,18 +507,18 @@ def query_quota_limits() -> Dict[str, Any]:
         next_reset = limit.get("nextResetTime", 0)
 
         if limit_type in QUOTA_LIMIT_TYPES:
-            kind = "Token" if limit_type == "TOKENS_LIMIT" else "额度"
             window = quota_window(limit)
-            if window == "5h":
-                print(f"⏱️  5小时 {kind} 限额:")
-            elif window == "week":
-                print(f"📅 周度 {kind} 限额:")
+            if limit_type == "TOKENS_LIMIT":
+                titles = {"5h": "⏱️  5小时 Token 限额:", "week": "📅 周度 Token 限额:"}
+                fallback = f"📦 Token 限额 (Unit {unit}, {number}):"
             else:
-                print(f"📦 {kind} 限额 (Unit {unit}, {number}):")
+                titles = {"5h": "⏱️  5小时积分额度:", "week": "📅 每周积分额度:"}
+                fallback = f"💳 积分额度 (Unit {unit}, {number}):"
+            print(titles.get(window, fallback))
 
             print(f"   {print_progress_bar(percentage)}")
             if limit_type == "CREDIT_LIMIT":
-                print(f"   已用: {limit.get('currentValue', 0):,} / {limit.get('usage', 0):,}")
+                print(f"   已用: {limit.get('currentValue', 0):,} / {limit.get('usage', 0):,} 积分")
             if next_reset:
                 print(f"   重置时间: {format_timestamp(next_reset)} "
                       f"({format_duration(next_reset - int(datetime.now().timestamp() * 1000))} 后)")

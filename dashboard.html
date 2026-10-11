@@ -212,6 +212,13 @@
             color: #888;
             display: flex;
             justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 2px 12px;
+        }
+
+        /* Wrap between items, never inside one ("12,000 积/分") */
+        .quota-meta span {
+            white-space: nowrap;
         }
 
         .stats-grid {
@@ -840,6 +847,13 @@
             return sign + String(a);
         }
 
+        // Exact integer with thousands separators (point quotas are small,
+        // so 12,000 reads better than 12.0K).
+        function formatInteger(num) {
+            const n = Number(num);
+            return isFinite(n) ? Math.round(n).toLocaleString('en-US') : '--';
+        }
+
         // Human readable age for the live-balance badge
         function formatAge(seconds) {
             if (seconds === null || seconds === undefined || !isFinite(seconds)) return '--';
@@ -1003,6 +1017,10 @@
                     liveQuota = payload;
                     liveQuotaError = null;
                     liveQuotaFetchedAt = Date.now() - (payload.age_seconds || 0) * 1000;
+                    // A fresh upstream fetch just updated the server cache that
+                    // /api/overview prefers; re-read it so the table and the
+                    // detail card agree (local data only, no upstream call).
+                    if (!payload.cached && users.length > 1) loadOverview();
                 } else {
                     liveQuotaError = (payload && payload.error) || `HTTP ${response.status}`;
                 }
@@ -1197,10 +1215,16 @@
             let html = '';
             const typeNames = {
                 'TOKENS_LIMIT': '🎫 Token 限额',
-                'CREDIT_LIMIT': '💳 额度限额',
+                'CREDIT_LIMIT': '💳 积分额度',
                 'TIME_LIMIT': '🔧 MCP 工具限额'
             };
-            const windowNames = { '5h': '⏱️ 5小时滚动窗口', 'week': '📅 周度限额' };
+            // TOKENS_LIMIT (older accounts) counts tokens; CREDIT_LIMIT (newer
+            // accounts) counts points (积分), which are not tokens — keep the
+            // labels apart so a point quota is never read as a token quota.
+            const windowNames = {
+                'TOKENS_LIMIT': { '5h': '⏱️ 5小时滚动窗口', 'week': '📅 周度限额' },
+                'CREDIT_LIMIT': { '5h': '⏱️ 5小时积分额度', 'week': '📅 每周积分额度' }
+            };
 
             for (const limit of (limits || [])) {
                 const type = limit.type;
@@ -1209,10 +1233,10 @@
                 const nextReset = limit.nextResetTime;
 
                 const window_ = quotaWindow(limit);
-                const name = windowNames[window_] || typeNames[type] || escapeHtml(type);
-                // CREDIT_LIMIT: usage = cap, currentValue = used
+                const name = (windowNames[type] || {})[window_] || typeNames[type] || escapeHtml(type);
+                // CREDIT_LIMIT: usage = point cap, currentValue = points used
                 const credit = type === 'CREDIT_LIMIT' && isFinite(Number(limit.usage))
-                    ? `<span>已用: ${formatNumber(Number(limit.currentValue) || 0)} / ${formatNumber(Number(limit.usage))}</span>`
+                    ? `<span>已用 ${formatInteger(limit.currentValue)} / ${formatInteger(limit.usage)} 积分</span>`
                     : '';
 
                 html += `
