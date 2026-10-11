@@ -155,10 +155,12 @@ def load_users(environ: Optional[Dict[str, str]] = None) -> UsersConfig:
             if not key:
                 errors.append(f"ZHIPUAI_API_KEYS 第 {idx} 项（{name}）key 为空，已忽略")
                 continue
-            if name in seen:
-                errors.append(f"ZHIPUAI_API_KEYS 第 {idx} 项用户名 {name} 重复，已忽略")
+            # Case-insensitive: usage_history.Bob.json and usage_history.bob.json
+            # are the same file on macOS / Windows filesystems.
+            if name.lower() in seen:
+                errors.append(f"ZHIPUAI_API_KEYS 第 {idx} 项用户名 {name} 重复（不区分大小写），已忽略")
                 continue
-            seen.add(name)
+            seen.add(name.lower())
             pairs.append((name, key))
         if legacy and pairs and legacy not in {k for _, k in pairs}:
             errors.append("ZHIPUAI_API_KEYS 已设置，ZHIPUAI_API_KEY 被忽略（且不在用户列表中）")
@@ -242,14 +244,20 @@ def format_pricing(model_id: str) -> str:
 # /api/paas/v4/models was judged a failure even on a perfectly good HTTP 200.
 # parse_envelope() decides by SHAPE, once, for every endpoint.
 # ---------------------------------------------------------------------------
-def parse_envelope(status_code: Optional[int], payload: Any) -> Tuple[bool, Any, Optional[str]]:
-    """Return (ok, data, error) for any upstream response body."""
+def parse_envelope(
+    status_code: Optional[int], payload: Any, secrets: Tuple[str, ...] = ()
+) -> Tuple[bool, Any, Optional[str]]:
+    """Return (ok, data, error) for any upstream response body.
+
+    `secrets` are redacted from the error text BEFORE any truncation: cutting
+    first could leave a key prefix that no longer matches the full key.
+    """
     if status_code != 200:
         detail = ""
         if isinstance(payload, dict):
             detail = str(payload.get("msg") or payload.get("message") or payload.get("error") or "")
         elif isinstance(payload, str):
-            detail = payload[:200]
+            detail = redact(payload, secrets)[:200]
         return False, None, f"HTTP {status_code}{': ' + detail if detail else ''}"
 
     if not isinstance(payload, dict):
@@ -338,7 +346,8 @@ def _http_request(
         # Never a bare `except:` — we want to know it was a decode problem, and
         # we keep the head of the raw text because that is what makes a
         # gateway/HTML error page identifiable at a glance.
-        snippet = raw[:200]
+        # Redact the full text first, then cut (see parse_envelope).
+        snippet = redact(raw, (API_KEY,))[:200]
         return status, None, f"HTTP {status}: 响应不是合法 JSON ({e.msg}); 原文前200字符: {snippet!r}"
 
 
@@ -371,7 +380,7 @@ def make_request(endpoint: str, method: str = "GET", params: Optional[Dict] = No
     if error is not None:
         return err_result(redact(f"{endpoint} -> {error}", (API_KEY,)))
 
-    ok, data, envelope_error = parse_envelope(status, payload)
+    ok, data, envelope_error = parse_envelope(status, payload, (API_KEY,))
     if ok:
         return ok_result(data)
     return err_result(redact(f"{endpoint} -> {envelope_error}", (API_KEY,)))

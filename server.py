@@ -88,7 +88,6 @@ class UserState:
         self.lock = threading.Lock()
         self.last_update_time = None    # last ATTEMPT (success or failure)
         self.last_success_time = None   # last time the query actually succeeded
-        self.next_update_time = None
         self.last_error = None
         self.consecutive_failures = 0
         self.query_in_progress = False
@@ -97,6 +96,7 @@ class UserState:
         self.last_manual_refresh = 0.0  # monotonic timestamp of the last accepted /api/refresh
 
         self.quota_lock = threading.Lock()
+        self.quota_fetch_lock = threading.Lock()  # single-flight for upstream calls
         self.quota_cache = {"fetched_at": None, "data": None, "error": None}
 
         self.summary_lock = threading.Lock()
@@ -104,6 +104,7 @@ class UserState:
 
 
 USERS = {}          # name -> UserState, in configuration order
+next_round_time = None  # when the scheduler's next collection round starts
 CONFIG_ERRORS = ()  # human-readable, key-free
 SECRETS = ()        # every key seen in the configuration, for redaction
 
@@ -164,12 +165,13 @@ def run_query(user):
             env=child_env,
         )
         rc = result.returncode
-        tail = (result.stderr or result.stdout or "").strip().splitlines()
-        tail = _redact(" | ".join(tail[-5:])[:500])
+        # Redact the whole output BEFORE truncating: cutting first can leave a
+        # key prefix that no longer matches the full key.
+        tail = _redact((result.stderr or result.stdout or "").strip()).splitlines()
+        tail = " | ".join(tail[-5:])[:500]
 
         with user.lock:
             user.last_update_time = started
-            user.next_update_time = started + timedelta(seconds=REFRESH_INTERVAL)
             if rc == 0:
                 user.last_success_time = started
                 user.last_error = None
@@ -194,7 +196,6 @@ def run_query(user):
     except subprocess.TimeoutExpired:
         with user.lock:
             user.last_update_time = started
-            user.next_update_time = started + timedelta(seconds=REFRESH_INTERVAL)
             user.last_error = "query timed out after 60s"
             user.consecutive_failures += 1
         log(f"[{user.name}] Query FAILED: timeout after 60s")
@@ -203,7 +204,6 @@ def run_query(user):
         msg = _redact(f"query error: {e}")
         with user.lock:
             user.last_update_time = started
-            user.next_update_time = started + timedelta(seconds=REFRESH_INTERVAL)
             user.last_error = msg
             user.consecutive_failures += 1
         log(f"[{user.name}] Query ERROR: {msg}")
@@ -220,10 +220,17 @@ def run_all_users():
 
 
 def scheduler():
-    """Background scheduler for auto-refresh (15 min by default)"""
+    """Background scheduler: one round right away, then every REFRESH_INTERVAL.
+
+    The interval counts from the END of a round, and that single "next round"
+    time is what every user's next_update reports. Stamping each user with its
+    own start + interval made later users in a serial round look due too early.
+    """
+    global next_round_time
     while True:
-        time.sleep(REFRESH_INTERVAL)
         run_all_users()
+        next_round_time = datetime.now(timezone.utc) + timedelta(seconds=REFRESH_INTERVAL)
+        time.sleep(REFRESH_INTERVAL)
 
 
 def _iso(dt):
@@ -254,7 +261,7 @@ def get_status(user):
             "user": user.name,
             "last_update": _iso(user.last_update_time),
             "last_success_time": _iso(user.last_success_time),
-            "next_update": _iso(user.next_update_time),
+            "next_update": _iso(next_round_time),
             "last_error": user.last_error,
             "consecutive_failures": user.consecutive_failures,
             "healthy": user.consecutive_failures == 0 and user.last_error is None,
@@ -293,7 +300,7 @@ def fetch_live_quota(user):
     except ValueError:
         payload = raw
 
-    ok, data, error = zhipu_usage.parse_envelope(status, payload)
+    ok, data, error = zhipu_usage.parse_envelope(status, payload, SECRETS)
     return ok, data, _redact(error)
 
 
@@ -309,19 +316,44 @@ def _quota_payload(ok, cached, fetched_at, data, error, now):
     }
 
 
-def get_live_quota(user, force=False):
-    """Cached live quota. 60s TTL; cache hits are flagged with cached: true."""
-    now = time.time()
+def _cached_quota(user, now, not_before=None):
+    """Cache hit payload, or None. `not_before`: only accept entries fetched after it."""
     with user.quota_lock:
         cache = user.quota_cache
         fetched_at = cache["fetched_at"]
-        if not force and fetched_at is not None and (now - fetched_at) < LIVE_QUOTA_TTL:
-            ok = cache["data"] is not None
-            payload = _quota_payload(ok, True, fetched_at, cache["data"], cache["error"], now)
-            payload["user"] = user.name
-            return payload
+        if fetched_at is None or (now - fetched_at) >= LIVE_QUOTA_TTL:
+            return None
+        if not_before is not None and fetched_at < not_before:
+            return None
+        payload = _quota_payload(cache["data"] is not None, True, fetched_at,
+                                 cache["data"], cache["error"], now)
+    payload["user"] = user.name
+    return payload
 
-    ok, data, error = fetch_live_quota(user)
+
+def get_live_quota(user, force=False):
+    """Cached live quota. 60s TTL; cache hits are flagged with cached: true.
+
+    Single-flight per user: on a miss only one thread calls upstream, the rest
+    wait on quota_fetch_lock and then take the entry it just stored.
+    """
+    requested_at = time.time()
+    if not force:
+        hit = _cached_quota(user, requested_at)
+        if hit is not None:
+            return hit
+
+    with user.quota_fetch_lock:
+        # Re-check: someone may have fetched while we waited. With force, only
+        # an entry fetched after this request arrived counts.
+        hit = _cached_quota(user, time.time(), not_before=requested_at if force else None)
+        if hit is not None:
+            return hit
+        ok, data, error = fetch_live_quota(user)
+        return _store_quota(user, ok, data, error)
+
+
+def _store_quota(user, ok, data, error):
     fetched = time.time()
     with user.quota_lock:
         user.quota_cache = {
@@ -434,6 +466,10 @@ def get_overview():
 # ---------------------------------------------------------------------------
 class UsageHandler(SimpleHTTPRequestHandler):
     """Custom handler for API endpoints"""
+
+    # Socket timeout per connection: with a threaded server a slow or idle
+    # client would otherwise pin a thread indefinitely.
+    timeout = 30
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(APP_DIR), **kwargs)
@@ -563,12 +599,13 @@ class UsageHandler(SimpleHTTPRequestHandler):
                 data = json.load(f)
         except json.JSONDecodeError as e:
             self.send_json_response(
-                {"user": user.name, "records": [], "error": f"历史文件已损坏: {e}"}, status=500
+                {"user": user.name, "records": [], "error": f"历史文件已损坏: {e.msg} (pos {e.pos})"}, status=500
             )
             return
         except OSError as e:
             self.send_json_response(
-                {"user": user.name, "records": [], "error": f"历史文件读取失败: {e}"}, status=500
+                # str(OSError) carries the server-side path: send only the type.
+                {"user": user.name, "records": [], "error": f"历史文件读取失败: {type(e).__name__}"}, status=500
             )
             return
         if isinstance(data, dict):
@@ -630,10 +667,9 @@ def main():
         print(f"⚠️  {err}")
     print("=" * 60, flush=True)
 
-    # The first query used to run synchronously BEFORE bind(), blocking startup
-    # for up to 60 seconds and making the healthcheck flap. Now it is a thread.
-    threading.Thread(target=run_all_users, daemon=True).start()
-
+    # The first round used to run synchronously BEFORE bind(), blocking startup
+    # for up to 60 seconds and making the healthcheck flap. The scheduler
+    # thread now runs it first, then waits.
     scheduler_thread = threading.Thread(target=scheduler, daemon=True)
     scheduler_thread.start()
     log("Scheduler started")

@@ -1155,10 +1155,11 @@
                 const type = limit.type;
                 const unit = limit.unit;
                 const number = limit.number;
-                const percentage = limit.percentage || 0;
+                // Upstream values: coerce/escape before they reach innerHTML.
+                const percentage = Number(limit.percentage) || 0;
                 const nextReset = limit.nextResetTime;
 
-                let name = typeNames[type] || type;
+                let name = typeNames[type] || escapeHtml(type);
                 if (type === 'TOKENS_LIMIT') {
                     if (unit === 3 && number === 5) name = '⏱️ 5小时滚动窗口';
                     else if (unit === 6 && number === 1) name = '📅 周度限额';
@@ -1240,11 +1241,12 @@
 
             for (const tool of details) {
                 const icon = icons[tool.modelName] || '🔧';
+                const toolName = escapeHtml(tool.modelName);
                 toolsHtml += `
                     <div class="tool-item">
                         <div class="tool-name">
                             <span class="icon">${icon}</span>
-                            <span>${tool.modelName}</span>
+                            <span>${toolName}</span>
                         </div>
                         <span class="tool-count">${formatNumber(tool.totalUsageCount)}</span>
                     </div>
@@ -1329,7 +1331,7 @@
             let barsHtml = '';
             for (const p of points) {
                 if (p.delta === null) {
-                    barsHtml += `<div class="chart-bar missing" title="${p.label} 无增量数据"></div>`;
+                    barsHtml += `<div class="chart-bar missing" title="${escapeHtml(p.label)} 无增量数据"></div>`;
                 } else {
                     const height = Math.max(2, (p.delta / maxDelta) * 100);
                     barsHtml += `<div class="chart-bar" style="height: ${height}%" data-value="${formatNumber(p.delta)}"></div>`;
@@ -1359,7 +1361,7 @@
 
             let labelsHtml = '';
             for (const p of points) {
-                labelsHtml += `<span>${p.label.split(' ')[1] || p.label}</span>`;
+                labelsHtml += `<span>${escapeHtml(p.label.split(' ')[1] || p.label)}</span>`;
             }
 
             return `

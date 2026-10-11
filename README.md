@@ -271,9 +271,14 @@ ZHIPUAI_API_KEYS=Alice:<key_of_alice>,Bob:<key_of_bob>
 | 第一个用户（`ZHIPUAI_API_KEYS` 的第一项，或旧格式的唯一用户） | `usage_history.json`（与旧版本同一个文件） |
 | 其余用户 | `usage_history.<用户名>.json` |
 
-从单用户升级到多用户时，**把原来的账户放在 `ZHIPUAI_API_KEYS` 的第一项**，它会继续写原来的
-`usage_history.json`，已有历史全部保留，不需要任何手工迁移。调整用户顺序会改变第一个用户与
-`usage_history.json` 的对应关系。
+从单用户升级到多用户时，把原来的账户放在 `ZHIPUAI_API_KEYS` 的第一项，它会继续写原来的
+`usage_history.json`，已有历史全部保留，不需要任何手工迁移。
+
+> ⚠️ **原账户必须始终保持在 `ZHIPUAI_API_KEYS` 的第一位。删除第一项或调换顺序，
+> `usage_history.json` 会改由新的第一个用户读写，导致历史错配（两个账户的记录混在同一个文件里）。**
+> 需要调整顺序时，先停服务，手工按新顺序重命名历史文件，再启动。
+
+用户名去重不区分大小写（`Bob` 与 `bob` 视为重名），因为大小写不敏感的文件系统上它们对应同一个历史文件。
 
 **采集方式**：后台按配置顺序**逐个用户串行**采集；每个用户的状态、实时余额缓存、刷新节流、
 「正在采集」锁相互独立，一个用户的 Key 失效只影响该用户，页面上其他用户照常显示。
@@ -341,7 +346,7 @@ Docker 模式下提供以下 API。标 `?user=` 的接口按用户区分：**不
 | `/api/users` | GET | 用户名列表 `{users:[{name,is_default}], default, config_errors}` |
 | `/api/overview` | GET | 每用户一行：`level` / `five_hour_pct` / `weekly_pct` / `tokens_24h` / `calls_24h` / `record_time` / `healthy` / `last_error` 等。只读本地历史与已有的实时余额缓存，**不触发上游请求** |
 | `/api/status?user=` | GET | 该用户的采集状态：`last_update` / `last_success_time` / `last_error` / `consecutive_failures` / `healthy`。不带参数且未配置任何 Key 时仍返回 200（健康检查用） |
-| `/api/quota/live?user=` | GET | **按需实时余额**，只打上游一个只读接口，每用户 60 秒内存缓存 |
+| `/api/quota/live?user=` | GET | **按需实时余额**，只打上游一个只读接口，每用户 60 秒内存缓存；缓存过期时并发请求只会触发一次上游调用 |
 | `/api/history?user=` | GET | 该用户的历史数据（趋势图数据源）；文件损坏时返回 500 + `error` 字段 |
 | `/api/refresh?user=` | POST | 触发该用户的强制采集（**仅 POST**；该用户正在跑时返回 409，过快返回 429） |
 
